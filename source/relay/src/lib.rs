@@ -364,7 +364,12 @@ mod tests {
         Duration::from_secs(s)
     }
 
-    fn register(r: &mut Relay, now: Duration, from: SocketAddr, nonce: u64) -> ([u8; 6], u64) {
+    fn register(
+        r: &mut Relay,
+        now: Duration,
+        from: SocketAddr,
+        nonce: u64,
+    ) -> ([u8; CODE_LENGTH], u64) {
         let asked = Datagram::Register {
             code: NO_CODE,
             nonce,
@@ -386,7 +391,7 @@ mod tests {
         }
     }
 
-    fn lookup(code: [u8; 6], nonce: u64) -> Vec<u8> {
+    fn lookup(code: [u8; CODE_LENGTH], nonce: u64) -> Vec<u8> {
         Datagram::Lookup { code, nonce }.encode()
     }
 
@@ -444,7 +449,7 @@ mod tests {
                 Some(Datagram::NoRoom { .. })
             ));
         };
-        refused(r.handle(secs(1), at(9, 1), &lookup(*b"ZZZZZZ", 1)));
+        refused(r.handle(secs(1), at(9, 1), &lookup(*b"ZZZZZ", 1)));
         assert_eq!(r.handle(secs(1), at(2, 6000), &lookup(code, 8)).len(), 2);
         // Asked again by the same joiner: the same answer.
         assert_eq!(r.handle(secs(1), at(2, 6000), &lookup(code, 8)).len(), 2);
@@ -481,14 +486,14 @@ mod tests {
         let noisy = at(9, 1);
         let mut answered = 0;
         for _ in 0..100 {
-            answered += r.handle(secs(0), noisy, &lookup(*b"ZZZZZZ", 1)).len();
+            answered += r.handle(secs(0), noisy, &lookup(*b"ZZZZZ", 1)).len();
         }
         assert_eq!(answered, CONTROL_BURST as usize);
         assert_eq!(r.rate_limited, 100 - CONTROL_BURST as u64);
         // Another address is not held back by it.
-        assert_eq!(r.handle(secs(0), at(8, 1), &lookup(*b"ZZZZZZ", 1)).len(), 1);
+        assert_eq!(r.handle(secs(0), at(8, 1), &lookup(*b"ZZZZZ", 1)).len(), 1);
         // And it comes back with time.
-        assert_eq!(r.handle(secs(1), noisy, &lookup(*b"ZZZZZZ", 1)).len(), 1);
+        assert_eq!(r.handle(secs(1), noisy, &lookup(*b"ZZZZZ", 1)).len(), 1);
     }
 
     #[test]
@@ -523,7 +528,7 @@ mod tests {
         for (_, reply) in r.handle(secs(0), joiner, &asked) {
             assert!(reply.len() <= asked.len());
         }
-        let asked = lookup(*b"ZZZZZZ", 8);
+        let asked = lookup(*b"ZZZZZ", 8);
         for (_, reply) in r.handle(secs(0), joiner, &asked) {
             assert!(reply.len() <= asked.len());
         }

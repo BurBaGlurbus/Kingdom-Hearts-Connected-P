@@ -82,7 +82,7 @@ fn pump(
 }
 
 /// A host with a room, and its code.
-fn room(server: &Server, timeout: Duration) -> (Session, [u8; 6]) {
+fn room(server: &Server, timeout: Duration) -> (Session, [u8; net::wire::CODE_LENGTH]) {
     let mut host =
         Session::host_room(Ipv4Addr::LOCALHOST, 0, server.addr, config("Host", timeout)).unwrap();
     let start = Instant::now();
@@ -169,7 +169,7 @@ fn a_wrong_code_is_refused_with_a_reason() {
     .unwrap();
     let mut join = Session::join_room(
         relay.addr,
-        *b"ZZZZZZ",
+        *b"ZZZZZ",
         config("Joiner", Duration::from_secs(5)),
     )
     .unwrap();

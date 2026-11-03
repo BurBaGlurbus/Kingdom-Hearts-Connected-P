@@ -13,7 +13,8 @@ use std::net::SocketAddrV4;
 pub const MAGIC: [u8; 4] = *b"KH2D";
 /// Bumped whenever a datagram or game message changes shape.
 /// 14: Hello and Welcome carry the player's id (KHC-044).
-pub const PROTOCOL: u16 = 14;
+/// 15: room codes are 5 letters (KHC-064).
+pub const PROTOCOL: u16 = 15;
 /// The first protocol whose Hello and Announce carry a readable version.
 const VERSIONED: u16 = 8;
 /// A player id's bytes (the hub's `PlayerId`; all zeros: none).
@@ -29,11 +30,12 @@ pub const REASON_LIMIT: usize = 255;
 pub const RELAYED_LIMIT: usize = 1500;
 /// A room code's length, and what it is made of: no letter or digit that can be
 /// taken for another (no 0, O, 1, I or L).
-pub const CODE_LENGTH: usize = 6;
+pub const CODE_LENGTH: usize = 5;
 pub const CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
 /// Padding in what asks the relay for something: its answers are no larger than
 /// what asked, so nobody can aim them at someone else for profit.
-const ASK_PADDING: [u8; 8] = [0; 8];
+/// [KHC-064] One more since codes are 5 letters.
+const ASK_PADDING: [u8; 9] = [0; 9];
 
 /// A room code as a player types it: any case, surrounding spaces ignored.
 pub fn parse_code(text: &str) -> Option<[u8; CODE_LENGTH]> {
@@ -433,7 +435,7 @@ impl Datagram {
             },
             REGISTER => {
                 let (code, nonce) = (r.array()?, r.u64()?);
-                let _: [u8; 8] = r.array()?;
+                let _: [u8; ASK_PADDING.len()] = r.array()?;
                 Datagram::Register { code, nonce }
             }
             REGISTERED => Datagram::Registered {
@@ -443,7 +445,7 @@ impl Datagram {
             },
             LOOKUP => {
                 let (code, nonce) = (r.array()?, r.u64()?);
-                let _: [u8; 8] = r.array()?;
+                let _: [u8; ASK_PADDING.len()] = r.array()?;
                 Datagram::Lookup { code, nonce }
             }
             PEER_AT => Datagram::PeerAt {
@@ -635,16 +637,16 @@ mod tests {
                 open: true,
             },
             Datagram::Register {
-                code: *b"AB23CD",
+                code: *b"AB23C",
                 nonce: 5,
             },
             Datagram::Registered {
                 nonce: 5,
-                code: *b"AB23CD",
+                code: *b"AB23C",
                 key: 6,
             },
             Datagram::Lookup {
-                code: *b"AB23CD",
+                code: *b"AB23C",
                 nonce: 7,
             },
             Datagram::PeerAt {
@@ -828,11 +830,11 @@ mod tests {
 
     #[test]
     fn a_room_code_is_read_as_a_player_types_it() {
-        assert_eq!(parse_code(" ab23cd "), Some(*b"AB23CD"));
-        assert_eq!(parse_code("AB23C"), None);
-        assert_eq!(parse_code("AB23CDE"), None);
-        assert_eq!(parse_code("AB23C0"), None, "no look-alikes");
-        assert_eq!(parse_code("ABCDEO"), None);
+        assert_eq!(parse_code(" ab23c "), Some(*b"AB23C"));
+        assert_eq!(parse_code("AB23"), None);
+        assert_eq!(parse_code("AB23CD"), None);
+        assert_eq!(parse_code("AB230"), None, "no look-alikes");
+        assert_eq!(parse_code("ABCDO"), None);
     }
 
     #[test]

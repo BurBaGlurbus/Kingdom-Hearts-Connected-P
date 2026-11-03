@@ -875,23 +875,16 @@ fn type_reply_code(net: &mut DuelNet, typed: &mut MessageReader<KeyboardInput>) 
     }
 }
 
-/// The host's reply code line: what is typed, or what came of it.
+/// The host's second line: the reply code typed, what came of it, or the
+/// hint to type one [KHC-063: two short lines in all; the room note stays in
+/// the log].
 fn reply_line(net: &DuelNet) -> String {
     if !net.reply_typed.is_empty() {
-        format!(
-            "
-Their reply code: {}_",
-            net.reply_typed
-        )
+        format!("Their reply code: {}_", net.reply_typed)
     } else if let Some(said) = &net.reply_said {
-        format!(
-            "
-{said}"
-        )
+        said.clone()
     } else {
-        "
-Friend not in? Type their reply code"
-            .into()
+        "Stuck? Type their reply code".into()
     }
 }
 
@@ -1268,12 +1261,8 @@ pub fn present(
     };
     let banner = match &net.status {
         Status::Waiting(_) if net.room_code.is_some() => Some(format!(
-            "Waiting for a player to join.\nRoom code {}{}{}",
+            "Room code {}\n{}",
             net.room_code.as_deref().unwrap_or_default(),
-            net.room_note
-                .as_deref()
-                .map(|n| format!("\n{n}"))
-                .unwrap_or_default(),
             reply_line(&net)
         )),
         Status::Waiting(port) if net.no_room_code.is_some() => Some(format!(
@@ -1286,9 +1275,7 @@ pub fn present(
         Status::Waiting(port) => Some(format!("Waiting for a player to join.\nUDP port {port}")),
         Status::Joining(host) => Some(format!("Joining {host}...")),
         Status::JoiningRoom(code) => Some(match &net.reply_code {
-            Some(reply) => format!(
-                "Joining room {code}...\nNot in yet? Give your friend this reply code:\n{reply}"
-            ),
+            Some(reply) => format!("Joining room {code}...\nNot in? Send your friend {reply}"),
             None => format!("Joining room {code}..."),
         }),
         Status::Playing => waiting_text(&net),

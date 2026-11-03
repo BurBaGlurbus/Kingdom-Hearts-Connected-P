@@ -4,7 +4,10 @@
 
 | Record | Task | Verdict |
 |---|---|---|
+| [KHC-065](KHC-065-engine-update-t380.md) | The engine's T380 brought in: guard arm, Explosion and Finishing Leap | PASS for building; play NOT RUN |
 | [KHC-062](KHC-062-open-source-review.md) | Pre-publish review: assets, licences, secrets and the network code; SECURITY.md, README top, licence texts | PASS: logo removed, relay keys and LAN discovery fixed; publishing as a fresh squashed repo waits on burba |
+| [KHC-064](KHC-064-five-letter-codes.md) | 5-letter room codes from the relay (PROTOCOL 15); serverless codes stay 12 | PARTIAL: tests PASS; two-PC relay duel NOT RUN |
+| [KHC-063](KHC-063-short-room-balloon.md) | A shorter balloon while hosting a room: the code and the reply-code hint | PARTIAL: host's seen; joiner's NOT RUN |
 | [KHC-061](KHC-061-no-debug.md) | No debug mode in Connected: no F3 menu, status line, collision view or F-key aids | PARTIAL: line gone in a capture; keys by hand NOT RUN |
 | [KHC-060](KHC-060-practice-menu.md) | Join a Room, Host a Room, LAN Host; Practice submenu for KH2 or KH3 against the training dummy | PARTIAL: KH2 practice runs; submenu by hand NOT RUN |
 | [KHC-059](KHC-059-menu-launcher.md) | The hub removed; the launcher in the 1.5+2.5 settings menu's look with Quick start, room codes first, Options and menu sounds | PARTIAL: built; sounds by ear and a duel from the new menu NOT RUN |
