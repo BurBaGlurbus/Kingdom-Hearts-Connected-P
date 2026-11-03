@@ -1,0 +1,17 @@
+# Names the hub refuses (names.rs). `=word`: the whole name; `word`: anywhere.
+# Kept small on purpose; the operator adds to it.
+=admin
+=administrator
+=mod
+=moderator
+=staff
+=system
+=server
+=khc
+=player
+official
+fuck
+shit
+cunt
+nazi
+hitler

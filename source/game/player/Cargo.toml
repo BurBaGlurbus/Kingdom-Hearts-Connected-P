@@ -1,0 +1,10 @@
+[package]
+name = "player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+# A private check against the original game's outputs; no tests of its own.
+[lints]
+workspace = true

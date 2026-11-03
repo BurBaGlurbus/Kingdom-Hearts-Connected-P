@@ -1,0 +1,13 @@
+[package]
+name = "kh3_shader"
+description = "KH3's compiled effect shaders as WGSL: reads D3D11 bytecode from the player's own install and translates it; ported from StrawHatPro's tools/sora_vfx_shaders.js (MIT; see NOTICE)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+naga = { version = "=29.0.4", default-features = false, features = ["wgsl-in"] }
+
+[lints]
+workspace = true

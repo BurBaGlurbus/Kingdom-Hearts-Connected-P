@@ -1,0 +1,4 @@
+# Use the MSVC-compatible LLVM linker shipped with the pinned Rust toolchain.
+# Windows SDK / MSVC libraries are still required; no extra linker install.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

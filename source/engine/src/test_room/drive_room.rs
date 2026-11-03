@@ -1,0 +1,2505 @@
+//! Drive Forms in the test room: the Drive / Revert command, the Antiform
+//! and forced-Final roll, the form-change task (drive-start motion, wait,
+//! object swap, drive-in motion), the form gauge's drain and the automatic
+//! revert, form EXP and level-ups (`player::forms` / `drive`).
+//!
+//! The original destroys the player object and builds a new one with the
+//! form's object entry (FUN_14040d000 → FUN_140405030). Here the same
+//! `Player` keeps its state and the kit (model, motions, PTYA set,
+//! movement record) is exchanged; the presentation respawns the model.
+use super::*;
+use data::{command_table, path_lookup::Library, sklt};
+use player::forms::{self, Forms};
+use std::sync::Mutex;
+
+/// Test-room choices: Sora owns Valor, Wisdom, Limit, Master and Final
+/// Form, all at level 1, and has nine Drive bars, so every form can be
+/// tried in the room.
+pub const ROOM_FORMS: [u8; 5] = [1, 2, 3, 4, 5];
+pub const ROOM_DRIVE_MAX: u8 = 9;
+
+/// FUN_14040d000: the wait before the swap (30 frames), the grey overlay's
+/// fade in (12) and out (15) (FUN_1403f76e0 / FUN_1403f76a0).
+const CHANGE_WAIT: u32 = 30;
+pub const OVERLAY_IN: f32 = 12.;
+pub const OVERLAY_OUT: f32 = 15.;
+/// FUN_1403f76e0(fx, 0x30, 0x30, 0x30, 12.0, 0x80) → FUN_1403f7040: the
+/// scene light colour moves from 0x80 toward 0x30 (the alpha byte is not
+/// read).
+const LIGHT_TARGET: f32 = 0x30 as f32;
+
+/// System-bank sounds the drive effects play (drivefx-01 §4): the drive
+/// start aura (P_EX100 effect 1), the revert (effect 15), Antiform's
+/// arrival (HTLF effect 100) and the form level-up (00effect 16).
+const SE_DRIVE: u32 = 114;
+const SE_REVERT: u32 = 115;
+const SE_ANTI: u32 = 132;
+const SE_FORM_LEVEL: u32 = 26;
+
+/// Menu messages: "Revert" (0x81e4, command-01 §1).
+pub const REVERT_LABEL: u32 = 0x81e4;
+/// The Drive and Revert commands (03system `cmd`), and Wisdom's Shoot.
+const CMD_REVERT: u16 = 5;
+const SHOOT: u16 = 0x16d;
+/// The Limit row, the four limits and their follow-ups, for their names.
+const LIMIT_NAMES: [u16; 13] = [
+    0x2c3, 0x2ba, 0x2bb, 0x2bc, 0x2bd, 0x2be, 0x2bf, 0x2c0, 0x2c1, 0x2c2, 0x2ab, 0x2ac, 0x2ae,
+];
+
+/// What builds a Drive form's kit: the object table, the forms' object
+/// ids (03system `memt` row 0), Sora's weapon joints (SKLT), the PTYA,
+/// PRTY and command tables, and base Sora's motion sets.
+pub struct FormSources {
+    objects: Vec<objentry::ObjectEntry>,
+    /// Base Sora's object name (form 0), whose kit a Keyblade change
+    /// rebuilds.
+    base_object: String,
+    /// The motions from other files in his kit (limits, summons, captures): a
+    /// rebuilt kit keeps them.
+    pub base_external: Vec<character_kit::KitMotion>,
+    /// `memt` row 0 (FUN_140405190): the object id of each form.
+    pub form_objects: [u16; 7],
+    /// `memt`, whose other rows hold a world costume's forms.
+    memt: Vec<u8>,
+    /// SKLT: each character's weapon joints.
+    sklt: Vec<sklt::SkltEntry>,
+    /// The debug menu's Outfits page.
+    pub outfits: Vec<super::outfit::Outfit>,
+    weapon_joint: usize,
+    second_joint: Option<usize>,
+    ptya: Vec<u8>,
+    pref: Vec<u8>,
+    went: Vec<u8>,
+    /// 03system `wmst`: 0x20-byte weapon motion-set names, row set × 2 +
+    /// slot (FUN_1403ef750).
+    wmst: Vec<u8>,
+    items: Vec<u8>,
+    sstm: actor_physics::Sstm,
+    base_set: motion::MotionSetSelection,
+    spell_ids: Vec<u16>,
+    hurt: bool,
+    basic_fk: bool,
+    /// 00battle `fmlv`.
+    pub fmlv: Vec<forms::FormLevel>,
+    /// plrp key-0 form records: starting abilities by form.
+    pub starting: Vec<(u8, Vec<u16>)>,
+    /// The command table, and each form's Drive command (its item's
+    /// +0x10, FUN_1403b6920).
+    pub commands: HashMap<u16, command_table::Command>,
+    pub form_command: [u16; 7],
+    /// Command names (system-font strings) by command id, and "Revert".
+    pub names: HashMap<u16, Vec<u8>>,
+    pub attack_label: Vec<u8>,
+    pub magic_label: Vec<u8>,
+    /// The level-up panels' text: item names (forms and abilities), sys
+    /// 0x43f2 "Form Gauge Powered Up!" and 0x51f "Sora".
+    pub item_names: HashMap<u16, Vec<u8>>,
+    pub gauge_up: Vec<u8>,
+    pub sora_title: Vec<u8>,
+    /// Sora's level-up and bonus-level panel texts and the `bons` table.
+    pub growth: super::level_growth::Texts,
+    pub drive_label: Vec<u8>,
+    pub revert_label: Vec<u8>,
+    /// 00effect's PAX (the form level-up's element 16) and the resident
+    /// `effect/texcommon.dpd`.
+    pub system_pax: Option<Arc<data::object_effect::Pax>>,
+    pub texcommon: Option<data::object_effect::Dpd>,
+    /// `obj/PRIZE.mdlx`'s effect: the prizes' sprites.
+    pub prize_pax: Option<Arc<data::object_effect::Pax>>,
+}
+
+/// The Keyblade items a kit holds: slot 0's (the member's equipped weapon)
+/// and slot 1's (the form's own, 0 = none chosen).
+#[derive(Clone, Copy, Debug)]
+pub struct Weapons {
+    pub main: u16,
+    pub sub: u16,
+}
+
+/// An object's own effects: the PAX (entry type 18) of `obj/<name>.a.us`.
+pub fn object_pax(library: &mut Library, name: &str) -> Option<data::object_effect::Pax> {
+    file_pax(library, &format!("obj/{name}.a.us"))
+}
+
+/// The first PAX of an installed BAR file.
+pub fn file_pax(library: &mut Library, path: &str) -> Option<data::object_effect::Pax> {
+    data::object_effect::read_file_pax(library, path)
+}
+
+fn u16_at(b: &[u8], at: usize) -> Option<u16> {
+    b.get(at..at + 2).map(|w| u16::from_le_bytes([w[0], w[1]]))
+}
+
+impl FormSources {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        system: &[u8],
+        battle: &[u8],
+        objects: &[objentry::ObjectEntry],
+        weapon_joint: usize,
+        base_object: &str,
+        base_set: motion::MotionSetSelection,
+        spell_ids: Vec<u16>,
+        hurt: bool,
+        basic_fk: bool,
+        sstm: actor_physics::Sstm,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // memt: u32 version, u32 count, 0x34-byte rows; row 0's u16 at
+        // +0x16 + form × 2 is the form's object (FUN_140405190).
+        let memt = bar_entry(system, b"memt")?;
+        let mut form_objects = [0u16; 7];
+        for (f, o) in form_objects.iter_mut().enumerate().skip(1) {
+            *o = u16_at(memt, 8 + 0x16 + f * 2).ok_or("memt truncated")?;
+        }
+        let sklt = sklt::read(bar_entry(system, b"sklt")?)?;
+        let second_joint = sklt
+            .iter()
+            .find(|e| e.character_id == 1)
+            .and_then(|e| usize::try_from(e.secondary_bone).ok());
+        let items = bar_entry(system, b"item")?;
+        let item_rows = data::item_table::read(items)?;
+        let mut form_command = [0u16; 7];
+        for (f, c) in form_command.iter_mut().enumerate().skip(1) {
+            *c = item_rows
+                .iter()
+                .find(|r| r.id == forms::FORM_ITEMS[f])
+                .map_or(0, |r| r.command);
+        }
+        let commands = command_table::read(bar_entry(system, b"cmd\0")?)?
+            .into_iter()
+            .map(|c| (c.id, c))
+            .collect();
+        let fmlv = data::battle_tables::form_levels(bar_entry(battle, b"fmlv")?)?
+            .into_iter()
+            .map(|r| forms::FormLevel {
+                id: r.id,
+                growth: r.growth,
+                ability: r.ability,
+                exp: r.exp,
+            })
+            .collect();
+        let starting =
+            data::battle_tables::form_starting_abilities(bar_entry(battle, b"plrp")?, 0)?;
+        Ok(FormSources {
+            objects: objects.to_vec(),
+            base_object: base_object.to_owned(),
+            base_external: Vec::new(),
+            form_objects,
+            memt: memt.to_vec(),
+            sklt,
+            outfits: Vec::new(),
+            weapon_joint,
+            second_joint,
+            ptya: bar_entry(battle, b"ptya")?.to_vec(),
+            pref: bar_entry(system, b"pref")?.to_vec(),
+            went: bar_entry(system, b"went")?.to_vec(),
+            wmst: bar_entry(system, b"wmst")?.to_vec(),
+            items: items.to_vec(),
+            sstm,
+            base_set,
+            spell_ids,
+            hurt,
+            basic_fk,
+            fmlv,
+            starting,
+            commands,
+            form_command,
+            names: HashMap::new(),
+            attack_label: Vec::new(),
+            magic_label: Vec::new(),
+            item_names: HashMap::new(),
+            gauge_up: Vec::new(),
+            sora_title: Vec::new(),
+            growth: super::level_growth::Texts {
+                bons: bar_entry(battle, b"bons")?.to_vec(),
+                ..Default::default()
+            },
+            drive_label: Vec::new(),
+            system_pax: None,
+            texcommon: None,
+            prize_pax: None,
+            revert_label: Vec::new(),
+        })
+    }
+
+    /// The command ids whose names the menu shows.
+    pub fn named_commands(&self) -> Vec<(u16, u32)> {
+        self.form_command
+            .iter()
+            .filter(|&&c| c != 0)
+            .chain([&CMD_REVERT, &SHOOT])
+            .chain(LIMIT_NAMES.iter())
+            .filter_map(|c| self.commands.get(c).map(|r| (*c, r.name)))
+            .collect()
+    }
+
+    pub fn command(&self, form: u8) -> Option<&command_table::Command> {
+        self.commands
+            .get(&self.form_command.get(form as usize).copied().unwrap_or(0))
+    }
+
+    /// The form's object entry (`memt`).
+    fn object(&self, form: u8) -> Result<&objentry::ObjectEntry, Box<dyn std::error::Error>> {
+        if form == 0 {
+            return self
+                .objects
+                .iter()
+                .find(|o| o.model_name == self.base_object.as_bytes())
+                .ok_or_else(|| "base Sora's object entry is absent".into());
+        }
+        let id = *self
+            .form_objects
+            .get(form as usize)
+            .ok_or("form out of range")? as u32;
+        self.objects
+            .iter()
+            .find(|o| o.object_id == id)
+            .ok_or_else(|| format!("form {form} object {id:#x} absent").into())
+    }
+
+    /// What `outfit` is to wear the place's object `object`: none for base
+    /// Sora, so he keeps the room's own kit path.
+    fn place_outfit(&self, object: u16) -> Option<u32> {
+        let base = self.object(0).ok()?.object_id;
+        // The World Map's row names its cursor, which is no body of his.
+        let body = self
+            .objects
+            .iter()
+            .find(|o| o.object_id == u32::from(object))
+            .is_some_and(|o| matches!(o.character, 1 | 14));
+        (body && u32::from(object) != base).then_some(u32::from(object))
+    }
+
+    /// Base Sora's model name.
+    pub fn base_model(&self) -> &str {
+        &self.base_object
+    }
+
+    /// The object form `form` shows while `outfit` is worn: the outfit, and
+    /// for a form the column of the outfit's `memt` row (FUN_140405190: u32
+    /// version, u32 count, 0x34-byte rows, the member's object at +0x10 and
+    /// the form's at +0x16 + form × 2), the default row's where it has none.
+    fn kit_object(
+        &self,
+        form: u8,
+        outfit: Option<u32>,
+    ) -> Result<&objentry::ObjectEntry, Box<dyn std::error::Error>> {
+        let Some(id) = outfit else {
+            return self.object(form);
+        };
+        if form == 0 {
+            return self
+                .objects
+                .iter()
+                .find(|o| o.object_id == id)
+                .ok_or_else(|| format!("outfit object {id:#x} absent").into());
+        }
+        let column = self
+            .memt
+            .get(8..)
+            .into_iter()
+            .flat_map(|rows| rows.as_chunks::<0x34>().0)
+            .find(|row| {
+                u16_at(*row, 0x10).is_some_and(|o| u32::from(o) == id)
+                    || (1..7)
+                        .any(|f| u16_at(*row, 0x16 + f * 2).is_some_and(|o| u32::from(o) == id))
+            })
+            .and_then(|row| u16_at(row, 0x16 + form as usize * 2))
+            .filter(|&o| o != 0);
+        match column.and_then(|o| self.objects.iter().find(|e| e.object_id == u32::from(o))) {
+            Some(object) => Ok(object),
+            None => self.object(form),
+        }
+    }
+
+    /// Builds form `form`'s kit from the installed files (run off the
+    /// main thread; the change task waits for it like FUN_14039e340). A
+    /// worn `outfit` takes base Sora's place; an object with no move set of
+    /// its own (objentry +0x4e = 0) plays by base Sora's tables.
+    pub fn build(
+        &self,
+        source: &ProbeSource,
+        form: u8,
+        weapons: Weapons,
+        outfit: Option<u32>,
+    ) -> Result<character_kit::Kit, Box<dyn std::error::Error>> {
+        let object = self.kit_object(form, outfit)?;
+        let worn = outfit.is_some() && form == 0;
+        let base = self.object(0)?;
+        let rules = if worn && object.neo_moveset == 0 {
+            base
+        } else {
+            object
+        };
+        let rules_name = String::from_utf8_lossy(&rules.model_name).into_owned();
+        // The object's own form decides its Keyblades and script motions.
+        let kit_form = if worn {
+            if matches!(object.form, 1..=6 | 10) {
+                object.form
+            } else {
+                0
+            }
+        } else {
+            form
+        };
+        let name = String::from_utf8_lossy(&object.model_name).into_owned();
+        let library = Library::open(source)?;
+        let find = |path: &str| library.find(path).ok_or(format!("{path} is not installed"));
+        let model = find(&format!("obj/{name}.mdlx"))?;
+        let mut actors =
+            model_inspection::read_model_at(source, model.index, model.ordinal, model.name_hash)?;
+        if actors.len() != 1 {
+            return Err("form model selection is not one model".into());
+        }
+        let mut actor = actors.remove(0);
+        actor.merge_parts_by_texture();
+        let bones = actor.skinning.bones.len();
+        let set_name = if worn {
+            super::outfit::motion_sets(object, &name)
+                .into_iter()
+                .find(|set| library.find(&format!("obj/{set}")).is_some())
+                .ok_or_else(|| format!("{name} has no motion set installed"))?
+        } else {
+            String::from_utf8_lossy(&object.animation_name).into_owned()
+        };
+        let set = find(&format!("obj/{set_name}"))?;
+        let motion_set = motion::MotionSetSelection {
+            index: set.index.to_owned(),
+            ordinal: set.ordinal,
+            name_hash: set.name_hash,
+            ..self.base_set.clone()
+        };
+        // Weapon slot 0: the equipped Keyblade through the object's WENT
+        // set (FUN_1403e0cc0 / FUN_1403d7c70); slot 1 (the objects whose
+        // wmst row names a second motion set) takes the form's own
+        // Keyblade (FUN_1402fc630), the main one while its record is empty
+        // [the original's handling of a Limit Form record was not traced].
+        let keyblades =
+            crate::keyblades::Keyblades::read(&self.went, &self.items, &self.objects, &rules_name)?;
+        // A worn body's WENT set may not name the equipped Keyblade.
+        let base_keyblades = if worn {
+            crate::keyblades::Keyblades::read(
+                &self.went,
+                &self.items,
+                &self.objects,
+                &self.base_object,
+            )
+            .ok()
+        } else {
+            None
+        };
+        let model_of = |item: u16| -> Option<&str> {
+            keyblades
+                .model(item)
+                .or_else(|| base_keyblades.as_ref().and_then(|k| k.model(item)))
+        };
+        let load_weapon = |item: u16| -> Result<
+            (model_inspection::InspectionModel, character_kit::Blade, f32),
+            Box<dyn std::error::Error>,
+        > {
+            let weapon_name = model_of(item)
+                .ok_or_else(|| format!("Keyblade {item:#x} has no model in the object's WENT set"))?
+                .to_owned();
+            let w = find(&format!("obj/{weapon_name}.mdlx"))?;
+            let mut library = Library::open(source)?;
+            let archive = library.read_found(&w)?;
+            let blade = character_kit::blade_spheres(&archive);
+            let reach = character_kit::blade_reach(&archive);
+            let mut models =
+                model_inspection::read_model_at(source, w.index, w.ordinal, w.name_hash)?;
+            if models.is_empty() {
+                return Err(format!("{weapon_name} has no model").into());
+            }
+            let mut model = models.remove(0);
+            model.merge_parts_by_texture();
+            Ok((model, blade, reach))
+        };
+        let (weapon, blade0, reach0) = load_weapon(weapons.main)?;
+        // The Keyblade's own effects (swing trail, hit sparks).
+        let weapon_pax =
+            model_of(weapons.main).and_then(|m| object_pax(&mut Library::open(source).ok()?, m));
+        // FUN_1403ef750: each weapon slot's motion set is `obj/%s.mset` of
+        // wmst row set × 2 + slot; an empty name (Antiform) leaves the
+        // weapon without motions and unattached.
+        let set_index = rules.neo_moveset as usize;
+        let wmst_name =
+            |slot: usize| data::weapon_entry::motion_set_name(&self.wmst, set_index, slot);
+        let weapon_set = |slot: usize| -> Result<Option<motion::MotionSetSelection>, String> {
+            let Some(n) = wmst_name(slot) else {
+                return Ok(None);
+            };
+            let path = format!("obj/{n}.mset");
+            if worn && library.find(&path).is_none() {
+                return Ok(None);
+            }
+            let f = find(&path)?;
+            Ok(Some(motion::MotionSetSelection {
+                index: f.index.to_owned(),
+                ordinal: f.ordinal,
+                name_hash: f.name_hash,
+                ..self.base_set.clone()
+            }))
+        };
+        let weapon_motion_set = weapon_set(0)?;
+        // Weapon joints: the room's Sora's, or a worn body's SKLT row, found by
+        // its object entry's byte +7 (FUN_1403d7620) or else its character.
+        // A body with none in its skeleton holds the Keyblade at the room's.
+        let joints = if worn {
+            let row = self
+                .sklt
+                .iter()
+                .find(|e| e.character_id == u32::from(object.weapon_joint))
+                .or_else(|| {
+                    self.sklt
+                        .iter()
+                        .find(|e| e.character_id == u32::from(object.character))
+                });
+            let primary = row
+                .and_then(|e| usize::try_from(e.primary_bone).ok())
+                .filter(|&j| j < bones)
+                .unwrap_or(self.weapon_joint.min(bones.saturating_sub(1)));
+            let second = row
+                .map_or(self.second_joint, |e| {
+                    usize::try_from(e.secondary_bone).ok()
+                })
+                .filter(|&j| j < bones);
+            (primary, second)
+        } else {
+            (self.weapon_joint, self.second_joint)
+        };
+        // Base Sora (objentry +0x57 = 0) has no slot 1.
+        let second_weapon_motion_set = if kit_form == 0 || joints.1.is_none() {
+            None
+        } else {
+            weapon_set(1)?
+        };
+        let second = if second_weapon_motion_set.is_some() {
+            Some(load_weapon(if weapons.sub != 0 {
+                weapons.sub
+            } else {
+                weapons.main
+            })?)
+        } else {
+            None
+        };
+        let (weapon2, blade1, reach1) = match second {
+            Some((model, blade, reach)) => (Some(model), blade, reach),
+            None => (None, character_kit::Blade::new(), reach0),
+        };
+        // Slot 1's own effects (its trail): the slot-1 Keyblade's archive.
+        let weapon2_pax = weapon2
+            .is_some()
+            .then(|| {
+                let item = if weapons.sub != 0 {
+                    weapons.sub
+                } else {
+                    weapons.main
+                };
+                model_of(item).and_then(|m| object_pax(&mut Library::open(source).ok()?, m))
+            })
+            .flatten();
+        let collision_archive = if self.hurt {
+            let mut lib = Library::open(source)?;
+            let own = lib.read_found(&model)?;
+            // A body with no object collision uses base Sora's.
+            if worn && character_kit::collision_entry(&own).is_none() {
+                let base_name = String::from_utf8_lossy(&base.model_name);
+                let found = find(&format!("obj/{base_name}.mdlx"))?;
+                Some(lib.read_found(&found)?)
+            } else {
+                Some(own)
+            }
+        } else {
+            None
+        };
+        let (params, _, _) = player_params(&self.objects, &rules_name, &self.pref, &self.sstm)?;
+        let pax = object_pax(&mut Library::open(source)?, &name);
+        // Slot 1 (the form Keyblade) hangs on SKLT's second bone.
+        let second_joint = second_weapon_motion_set
+            .is_some()
+            .then_some(joints.1)
+            .flatten();
+        // A worn body plays its own set, then base Sora's if it has his
+        // skeleton.
+        let fallback = if worn {
+            let base_name = String::from_utf8_lossy(&base.model_name);
+            let base_model = find(&format!("obj/{base_name}.mdlx"))?;
+            let base_bones = model_inspection::read_model_at(
+                source,
+                base_model.index,
+                base_model.ordinal,
+                base_model.name_hash,
+            )?
+            .first()
+            .map_or(0, |m| m.skinning.bones.len());
+            (base_bones == bones).then(|| self.base_set.clone())
+        } else {
+            (form != 0).then(|| self.base_set.clone())
+        };
+        // A body with another skeleton than its set's owner shares only the
+        // bones whose parents match (a cutscene body: its body, not its hair
+        // or face).
+        let owner = set_name.strip_suffix(".mset").unwrap_or(&set_name);
+        let owner_bones = if worn {
+            library
+                .find(&format!("obj/{owner}.mdlx"))
+                .and_then(|found| {
+                    let mut models = model_inspection::read_model_at(
+                        source,
+                        found.index,
+                        found.ordinal,
+                        found.name_hash,
+                    )
+                    .ok()?;
+                    Some(std::mem::take(&mut models.first_mut()?.skinning.bones))
+                })
+        } else {
+            None
+        };
+        let shared_bones =
+            owner_bones
+                .filter(|owner| owner.len() != bones)
+                .map_or(usize::MAX, |owner| {
+                    owner
+                        .iter()
+                        .zip(&actor.skinning.bones)
+                        .take_while(|(a, b)| a.header_i32[1] == b.header_i32[1])
+                        .count()
+                });
+        character_kit::load_kit(
+            source,
+            character_kit::KitInputs {
+                form: kit_form,
+                actor,
+                weapon,
+                weapon2,
+                blades: [blade0, blade1],
+                blade_reach: [reach0, reach1],
+                weapon_pax,
+                weapon2_pax,
+                weapon_joint: joints.0,
+                second_joint,
+                motion_set,
+                fallback,
+                lenient: worn,
+                shared_bones,
+                weapon_motion_set,
+                second_weapon_motion_set,
+                ptya: &self.ptya,
+                ptya_pointer: rules.neo_moveset as usize,
+                spell_ids: self.spell_ids.clone(),
+                hurt: self.hurt,
+                collision_archive,
+                basic_fk: self.basic_fk,
+                params,
+                pax,
+                // Limit Form's limits (limitform-01 §3.4).
+                scripted: if kit_form == forms::LIMIT {
+                    [211, 212, 213]
+                        .into_iter()
+                        .chain(221..=227)
+                        .chain(231..=234)
+                        .chain(241..=248)
+                        .chain([player::WALL_RECOIL_AIR])
+                        .collect()
+                } else if form == 0 && !worn {
+                    vec![
+                        player::WALL_RECOIL_AIR,
+                        summon::CALL_MOTION,
+                        summon::APPEAR_MOTION,
+                    ]
+                } else {
+                    vec![player::WALL_RECOIL_AIR]
+                },
+                // A worn body opens chests like the base one. [U] A Drive
+                // form's capture variant was not traced.
+                external: if worn {
+                    boss::chest_clips()
+                } else if form == 0 {
+                    self.base_external.clone()
+                } else {
+                    Vec::new()
+                },
+            },
+        )
+    }
+}
+
+/// The battle state DAT_142a11404 as FUN_1403ab6f0 keeps it: an enemy in
+/// range sets it after 45 frames, out of range clears it after 120.
+#[derive(Default)]
+pub struct BattleState {
+    pub on: bool,
+    counter: u32,
+    since_reset: u32,
+}
+
+impl BattleState {
+    pub fn update(&mut self, target: bool) {
+        self.since_reset = self.since_reset.saturating_add(1);
+        if target != self.on {
+            self.counter += 1;
+            let need = if target { 45 } else { 120 };
+            if self.since_reset <= 30 || self.counter >= need {
+                self.on = target;
+                self.counter = 0;
+            }
+        } else {
+            self.counter = 0;
+        }
+    }
+}
+
+/// A form kit being built off the main thread.
+type KitSlot = Arc<Mutex<Option<Result<character_kit::Kit, String>>>>;
+/// Sora's model and Keyblade parts.
+type ModelParts = Or<(With<SoraPart>, With<WeaponPart>)>;
+
+/// The form-change task (FUN_14040caa0's record).
+pub struct Change {
+    pub target: u8,
+    /// Frames since the task started.
+    pub frames: u32,
+    /// FUN_1403ba9a0 at the start (flags bit 0): the new object falls.
+    pub airborne: bool,
+}
+
+/// One kit's pieces as the room keeps them while another is active.
+struct Stash {
+    target_shape: Option<object_collision::Entry>,
+    params: Params,
+    clips: Clips,
+    poses: HashMap<(Action, bool), usize>,
+    clip_poses: Arc<Vec<ClipPoses>>,
+    body: Vec<(usize, Vec3, f32, bool)>,
+    attack: HashMap<u8, Vec<(usize, Vec3, f32)>>,
+    /// The kit's two Keyblades' attack spheres.
+    blade: [character_kit::Blade; 2],
+    /// Its slot 0 Keyblade's effects (None: the room's default), and slot
+    /// 1's.
+    weapon_pax: Option<Arc<data::object_effect::Pax>>,
+    weapon2_pax: Option<Arc<data::object_effect::Pax>>,
+    /// Its body shapes (kind 1) and objentry weight (+0x50; Antiform 25).
+    obj_shapes: Vec<object_collision::Entry>,
+    weight: f32,
+}
+
+/// Drive state of the session.
+pub struct DriveRt {
+    pub src: Arc<FormSources>,
+    source: Arc<ProbeSource>,
+    pub forms: Forms,
+    /// DAT_1409acdd4: the form Sora is in or changing to.
+    pub form: u8,
+    /// The kit the room plays now.
+    pub shown: u8,
+    /// DAT_142a10508 bit 0: a form is active.
+    pub active: bool,
+    pub change: Option<Change>,
+    stash: HashMap<u8, Stash>,
+    /// Models of every kit built so far (actor, Keyblade, slot-1 joint).
+    pub models: HashMap<
+        u8,
+        (
+            model_inspection::InspectionModel,
+            model_inspection::InspectionModel,
+            Option<model_inspection::InspectionModel>,
+        ),
+    >,
+    /// The member's equipped Keyblade (slot 0 of every kit) and the kits'
+    /// rebuild after it changes.
+    pub main_weapon: u16,
+    reweapon: Option<u8>,
+    /// The object worn in base Sora's place (the debug menu's Outfits), and
+    /// what the last choice came to, for its notice.
+    pub outfit: Option<u32>,
+    outfit_pending: bool,
+    /// The change is the place's, not the menu's: no notice.
+    outfit_quiet: bool,
+    pub outfit_result: Option<String>,
+    /// Keyblades each kit shows: 0 (Antiform), 1 or 2.
+    pub weapons: HashMap<u8, u8>,
+    loading: Option<(u8, KitSlot)>,
+    ready: HashMap<u8, character_kit::Kit>,
+    /// The shared battle RNG DAT_140783ca0 (image value 1).
+    pub seed: u32,
+    pub battle: BattleState,
+    /// Test-room choice (F12 toggles it): with no party members in the
+    /// room, Donald and Goofy count as present and usable for the party
+    /// requirement, so Valor, Wisdom, Master and Final can be tried
+    /// anywhere. A room with the party uses the real members.
+    pub party: bool,
+    /// The room has party members (party_room): the slots come from them.
+    real_party: bool,
+    slots: [Option<forms::Member>; 2],
+    /// Members absorbed by the form and the frames since they left
+    /// (FUN_140400990: they fade out over 15).
+    stored: Vec<(usize, u32)>,
+    /// FUN_1403f3fa0's rotating base sector (DAT_142ae5d78).
+    sector: u8,
+    /// A menu request: drive into a form (its command's form), or 0 to
+    /// revert.
+    pub request: Option<u8>,
+    /// The presentation rebuilds the model for this kit.
+    pub respawn: Option<u8>,
+    /// Grey overlay alpha 0..=1 of 0x80 and its per-frame step.
+    pub overlay: f32,
+    overlay_step: f32,
+    /// Level-ups to announce ("Form Gauge Powered Up").
+    pub level_ups: Vec<forms::LevelUp>,
+    /// Form EXP earned this frame (applied with Sora's ability slots).
+    pub pending_exp: i32,
+    /// The defeated-enemy character id for Wisdom / Final EXP.
+    pub enemy_character: u16,
+    /// The forms behind the open Drive submenu's rows.
+    pub menu_forms: Vec<u8>,
+    /// Each kit's object PAX, the effect starts this tick, the kit whose
+    /// object was just replaced, and the motion trigger scan's position.
+    pub paxes: HashMap<u8, Arc<data::object_effect::Pax>>,
+    /// Each form's script motions' trigger tables (Limit Form's limits).
+    pub script_events: HashMap<u8, HashMap<u16, enemy::motion::MotionEvents>>,
+    pub fx_requests: Vec<drive_fx::FxRequest>,
+    pub fx_owner_left: Option<u8>,
+    fx_scan: Option<(u64, Action, u32)>,
+    previous_shown: u8,
+    /// Limit Form: one of its limits runs (the party-limit scene), a
+    /// requested one, and the limit's colour filter (colour and ramp
+    /// 0..=1).
+    pub limit_running: bool,
+    pub limit_request: Option<u16>,
+    pub tint: [u8; 3],
+    pub tint_k: f32,
+    pub tint_step: f32,
+    /// The change's afterimage: ramp k (alpha = trunc(0x70·k)), its speed
+    /// and the ticks left once the swap starts its fade.
+    after: Option<(f32, f32, u32)>,
+    /// Wisdom Form's bullets in flight, and those that ended this tick
+    /// (key, true when their life ran out rather than a hit).
+    pub bullets: Vec<player::wisdom_form::Bullet>,
+    pub bullet_ends: Vec<(u64, bool)>,
+    bullet_serial: u64,
+}
+
+impl DriveRt {
+    pub fn new(src: FormSources, source: Arc<ProbeSource>, enemy_character: u16) -> Self {
+        Self::with_shared(Arc::new(src), source, enemy_character)
+    }
+
+    fn with_shared(src: Arc<FormSources>, source: Arc<ProbeSource>, enemy_character: u16) -> Self {
+        let mut forms = Forms::default();
+        for &(f, ref list) in &src.starting {
+            if let Some(r) = forms.record_mut(f) {
+                for &id in list {
+                    r.add_ability(id);
+                }
+            }
+        }
+        for f in ROOM_FORMS {
+            forms.obtain(f, KINGDOM_KEY);
+        }
+        DriveRt {
+            src,
+            source,
+            forms,
+            form: 0,
+            shown: 0,
+            active: false,
+            change: None,
+            stash: HashMap::new(),
+            models: HashMap::new(),
+            outfit: None,
+            outfit_pending: false,
+            outfit_quiet: false,
+            outfit_result: None,
+            main_weapon: KINGDOM_KEY,
+            reweapon: None,
+            weapons: HashMap::new(),
+            loading: None,
+            ready: HashMap::new(),
+            seed: 1,
+            battle: BattleState::default(),
+            party: true,
+            real_party: false,
+            slots: [None, None],
+            stored: Vec::new(),
+            sector: 0,
+            request: None,
+            respawn: None,
+            overlay: 0.,
+            overlay_step: 0.,
+            level_ups: Vec::new(),
+            pending_exp: 0,
+            enemy_character,
+            menu_forms: Vec::new(),
+            bullets: Vec::new(),
+            bullet_ends: Vec::new(),
+            limit_running: false,
+            limit_request: None,
+            tint: [128; 3],
+            tint_k: 0.,
+            tint_step: 0.,
+            after: None,
+            paxes: HashMap::new(),
+            script_events: HashMap::new(),
+            fx_requests: Vec::new(),
+            fx_owner_left: None,
+            fx_scan: None,
+            previous_shown: 0,
+            bullet_serial: 0,
+        }
+    }
+
+    /// Wisdom's bullets in flight end, their effects with them (a door).
+    pub fn end_shots(&mut self) {
+        let bullets = std::mem::take(&mut self.bullets);
+        self.bullet_ends
+            .extend(bullets.iter().map(|b| (b.key, false)));
+    }
+
+    /// A second Sora's drive state: the same tables and
+    /// form records, kits of its own (loaded as it needs them).
+    /// Another Sora's bullet keys: his slot in the serial's high bits, so
+    /// his bullets' effects never meet the room Sora's.
+    pub fn offset_bullet_keys(&mut self, slot: u8) {
+        self.bullet_serial = (u64::from(slot) + 1) << 40;
+    }
+
+    /// Wisdom Form's effects (its bullets' look) once its kit is loaded,
+    /// whether or not the form was ever taken: a joiner draws the other
+    /// Sora's bullets, and the KH3 ruleset's shotlock bolts ride them.
+    pub fn wisdom_pax(&mut self) -> Option<Arc<data::object_effect::Pax>> {
+        self.form_pax(forms::WISDOM)
+    }
+
+    /// A form's effects once its kit is loaded (taken into `paxes`, where
+    /// the form change finds them too); the KH3 ruleset's looks borrow
+    /// from them.
+    pub fn form_pax(&mut self, form: u8) -> Option<Arc<data::object_effect::Pax>> {
+        if let Some(p) = self.paxes.get(&form) {
+            return Some(Arc::clone(p));
+        }
+        let p = Arc::new(self.ready.get_mut(&form)?.pax.take()?);
+        self.paxes.insert(form, Arc::clone(&p));
+        Some(p)
+    }
+
+    /// Joiner: a Sora's bullets as the host's snapshot has them (key,
+    /// position, direction). A new one starts its effect; one gone fades.
+    pub fn show_bullets(
+        &mut self,
+        shown: &[(u64, [f32; 3], [f32; 3])],
+        fx_styled: &mut Vec<(super::drive_fx::Placed, super::drive_fx::Style)>,
+    ) {
+        let ends = &mut self.bullet_ends;
+        self.bullets.retain(|b| {
+            let keep = shown.iter().any(|s| s.0 == b.key);
+            if !keep {
+                ends.push((b.key, true));
+            }
+            keep
+        });
+        for &(key, pos, dir) in shown {
+            if let Some(b) = self.bullets.iter_mut().find(|b| b.key == key) {
+                b.pos = pos;
+                b.dir = dir;
+                continue;
+            }
+            self.bullets
+                .push(player::wisdom_form::Bullet::new(key, 0, pos, dir));
+            if let Some(pax) = self.wisdom_pax() {
+                fx_styled.push((
+                    super::drive_fx::Placed {
+                        req: super::drive_fx::FxRequest {
+                            pax,
+                            id: BULLET_ELEMENT,
+                            owner: forms::WISDOM,
+                        },
+                        anchor: super::drive_fx::Anchor::Bullet(key),
+                    },
+                    (super::hooks().bullet_style)(key),
+                ));
+            }
+        }
+    }
+
+    pub fn sibling(&self) -> Self {
+        let mut d = DriveRt::with_shared(
+            Arc::clone(&self.src),
+            Arc::clone(&self.source),
+            self.enemy_character,
+        );
+        d.forms = self.forms.clone();
+        d.main_weapon = self.main_weapon;
+        d.party = self.party;
+        d.paxes = self.paxes.clone();
+        d.script_events = self.script_events.clone();
+        d
+    }
+
+    /// Starts building the next form kit not ready yet (one at a time), so
+    /// a duel's form changes never wait on a load. Returns whether every
+    /// owned form is ready.
+    pub fn preload(&mut self) -> bool {
+        let mut log = Vec::new();
+        for f in 1..=forms::ANTI {
+            if f != forms::ANTI && !self.forms.owned.get(f as usize).copied().unwrap_or(false) {
+                continue;
+            }
+            match self.loaded(f, &mut log) {
+                Ok(true) => continue,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// The afterimage's previous-frame weight, while it is on.
+    pub fn afterimage(&self) -> Option<f32> {
+        self.after.map(|(k, _, _)| (0x70 as f32 * k).trunc() / 128.)
+    }
+
+    /// FUN_1403f7040 / FUN_1401626f0: the scene light factor,
+    /// The colour filters this holds (FUN_1403f7040: 0x80 + trunc((colour −
+    /// 0x80) × k), 0x80 = 1.0): the Drive change's grey over its ramp, and
+    /// the Limit Form limit's colour.
+    pub fn scene_filters(&self) -> [[u32; 3]; 2] {
+        let byte = |c: f32, k: f32| (128. + ((c - 128.) * k).trunc()).clamp(0., 255.) as u32;
+        [
+            [byte(LIGHT_TARGET, self.overlay); 3],
+            self.tint.map(|c| byte(f32::from(c), self.tint_k)),
+        ]
+    }
+
+    /// The party slots as FUN_140400740 sees them.
+    pub fn members(&self) -> [Option<forms::Member>; 2] {
+        if self.real_party {
+            self.slots
+        } else if self.party {
+            [
+                Some(forms::Member {
+                    character: 2,
+                    usable: true,
+                }),
+                Some(forms::Member {
+                    character: 3,
+                    usable: true,
+                }),
+            ]
+        } else {
+            [None, None]
+        }
+    }
+
+    /// FUN_140401d60 case 4 for form `form`'s Drive command.
+    pub fn selectable(&self, form: u8, gauge: &player::drive::Gauge) -> bool {
+        let Some(cmd) = self.src.command(form) else {
+            return false;
+        };
+        forms::DriveCheck {
+            form,
+            cost: cmd.cost,
+            level: gauge.level,
+            busy: self.active || self.change.is_some(),
+            player_form: self.form,
+            party: forms::party_requirement(form, &self.members(), 1.),
+            limit_barred: false,
+            locked: false,
+        }
+        .selectable()
+            && self.forms.owned[form as usize]
+    }
+
+    /// The Drive submenu: the owned forms in form order, each with its
+    /// command's colour (0 usable, 5 greyed).
+    pub fn menu(&self, gauge: &player::drive::Gauge) -> Vec<(u8, u16, usize)> {
+        (1..6u8)
+            .filter(|&f| self.forms.owned[f as usize])
+            .map(|f| {
+                let colour = if self.selectable(f, gauge) { 0 } else { 5 };
+                (f, self.src.form_command[f as usize], colour)
+            })
+            .collect()
+    }
+
+    /// FUN_1403b6cb0: command `id` (followed up its +2 chain to its root)
+    /// is disabled in the current form (cmd +0x2c bit form).
+    pub fn masked(&self, id: u16) -> bool {
+        if !self.active {
+            return false;
+        }
+        let mut c = self.src.commands.get(&id);
+        for _ in 0..8 {
+            match c {
+                Some(cmd) if cmd.execute != cmd.id => match self.src.commands.get(&cmd.execute) {
+                    Some(next) => c = Some(next),
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        c.is_some_and(|cmd| cmd.form_mask >> self.form & 1 != 0)
+    }
+
+    /// In Limit Form (its Magic slot is "Limit").
+    pub fn limit_form(&self) -> bool {
+        self.active && self.form == forms::LIMIT && self.change.is_none()
+    }
+
+    /// Submenu 12's rows and colours (FUN_1403d88e0).
+    pub fn limit_rows(&self, mp: i32, charging: bool) -> Vec<(u16, usize)> {
+        player::limit_form::LIMITS
+            .iter()
+            .map(|&c| {
+                let cost = self.src.commands.get(&c).map_or(0, |r| r.cost);
+                (
+                    c,
+                    player::limit_form::colour(cost, self.limit_running, mp, charging),
+                )
+            })
+            .collect()
+    }
+
+    /// The Attack row's label: Wisdom's "Shoot" (0x16d) in that form,
+    /// else Attack (None when the names were not loaded).
+    pub fn attack_label(&self) -> Option<Vec<u8>> {
+        let label = if self.active && self.form == forms::WISDOM {
+            self.src.names.get(&SHOOT)?.clone()
+        } else {
+            self.src.attack_label.clone()
+        };
+        (!label.is_empty()).then_some(label)
+    }
+
+    /// FUN_1403f36c0: in Antiform the Revert command is greyed while the
+    /// battle flag is set.
+    pub fn revert_usable(&self) -> bool {
+        self.active && self.change.is_none() && !(self.form == forms::ANTI && self.battle.on)
+    }
+
+    /// The model of the kit on screen, whose face the gauge shows.
+    pub fn shown_model(&self) -> Option<String> {
+        let object = self.src.kit_object(self.shown, self.outfit).ok()?;
+        Some(String::from_utf8_lossy(&object.model_name).into_owned())
+    }
+
+    /// The installed source, for a load off the main thread.
+    pub fn source(&self) -> Arc<ProbeSource> {
+        Arc::clone(&self.source)
+    }
+
+    fn start_load(&mut self, form: u8) {
+        if self.ready.contains_key(&form)
+            || self.stash.contains_key(&form)
+            || self.loading.as_ref().is_some_and(|l| l.0 == form)
+        {
+            return;
+        }
+        let slot = Arc::new(Mutex::new(None));
+        let (src, source, out) = (
+            Arc::clone(&self.src),
+            Arc::clone(&self.source),
+            Arc::clone(&slot),
+        );
+        let weapons = self.weapons_for(form);
+        let outfit = self.outfit;
+        std::thread::spawn(move || {
+            let built = src
+                .build(&source, form, weapons, outfit)
+                .map_err(|e| e.to_string());
+            if let Ok(mut o) = out.lock() {
+                *o = Some(built);
+            }
+        });
+        self.loading = Some((form, slot));
+    }
+
+    /// The Keyblades form `form`'s kit holds: the equipped one, and the
+    /// form's own (FUN_1402fc630).
+    fn weapons_for(&self, form: u8) -> Weapons {
+        Weapons {
+            main: self.main_weapon,
+            sub: self.forms.record(form).map_or(0, |r| r.keyblade),
+        }
+    }
+
+    /// The equipped Keyblade or a form's Keyblade changed: every kit built
+    /// with the old ones is dropped, and the one on screen is rebuilt in the
+    /// background and swapped in when ready (the weapon-change list,
+    /// FUN_14036afa0 / FUN_14036b210, replaces the weapon objects).
+    pub fn keyblades_changed(&mut self, main: u16) {
+        self.main_weapon = main;
+        self.ready.clear();
+        self.stash.clear();
+        self.loading = None;
+        self.reweapon = Some(self.shown);
+        self.start_load(self.shown);
+    }
+
+    /// Whether form `form`'s kit can be swapped in now.
+    fn loaded(&mut self, form: u8, log: &mut Vec<serde_json::Value>) -> Result<bool, String> {
+        if self.ready.contains_key(&form) || self.stash.contains_key(&form) {
+            return Ok(true);
+        }
+        let Some((f, slot)) = &self.loading else {
+            self.start_load(form);
+            return Ok(false);
+        };
+        if *f != form {
+            // Another kit holds the load: when it ends it is kept, and this
+            // one takes its turn.
+            let other = *f;
+            let done = slot
+                .lock()
+                .map_err(|_| "form loader stopped".to_owned())?
+                .take();
+            if let Some(done) = done {
+                if let Ok(kit) = done {
+                    self.ready.insert(other, kit);
+                }
+                self.loading = None;
+                self.start_load(form);
+            }
+            return Ok(false);
+        }
+        let built = slot
+            .lock()
+            .map_err(|_| "form loader stopped".to_owned())?
+            .take();
+        match built {
+            Some(Ok(kit)) => {
+                let p = &kit.params;
+                log.push(
+                    serde_json::json!({"event":"form_kit","form":form,"summary":kit.summary,
+                    "params":{"walk":p.walk_speed,"run":p.run_speed,"jump":p.jump_height,
+                    "turn":p.turn_speed,"fall_max":p.fall_max,"land_inertia":p.land_inertia,
+                    "land_drag":p.land_drag}}),
+                );
+                self.ready.insert(form, kit);
+                self.loading = None;
+                Ok(true)
+            }
+            Some(Err(e)) => {
+                self.loading = None;
+                Err(e)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
+/// The room starts on the place's body: its kit is built here, with the
+/// session's load, and swaps in on the first tick.
+pub fn start_on_place(game: &mut Game, object: u16) {
+    let Some(d) = game.drive.as_mut() else { return };
+    let outfit = d.src.place_outfit(object);
+    if outfit.is_none() {
+        return;
+    }
+    d.outfit = outfit;
+    d.outfit_pending = true;
+    d.outfit_quiet = true;
+    let weapons = d.weapons_for(0);
+    match d.src.build(&d.source, 0, weapons, outfit) {
+        Ok(kit) => {
+            d.ready.insert(0, kit);
+            d.reweapon = Some(0);
+        }
+        Err(e) => {
+            eprintln!("The place's body failed to load: {e}");
+            d.outfit = None;
+            d.outfit_pending = false;
+        }
+    }
+}
+
+/// FUN_140405190's object for the place the room entered: Sora wears it, and a
+/// form in play is rebuilt on it (the form's column of the same `memt` row).
+/// A body from the debug menu lasts until here.
+pub fn wear_place(game: &mut Game, object: u16) {
+    let Some(d) = game.drive.as_mut() else { return };
+    let outfit = d.src.place_outfit(object);
+    if d.outfit == outfit {
+        return;
+    }
+    d.outfit = outfit;
+    d.outfit_pending = true;
+    d.outfit_quiet = true;
+    d.outfit_result = None;
+    d.keyblades_changed(d.main_weapon);
+}
+
+/// Wears `outfit` in base Sora's place, or base Sora again: a form in play
+/// ends, and the kit is rebuilt in the background and swapped in when ready.
+pub fn set_outfit(game: &mut Game, outfit: Option<u32>) {
+    end_form(game);
+    let Some(d) = game.drive.as_mut() else { return };
+    d.outfit = outfit;
+    d.outfit_pending = true;
+    d.outfit_quiet = false;
+    d.outfit_result = None;
+    d.keyblades_changed(d.main_weapon);
+}
+
+/// FUN_14040ce60: start a change to `form` (0 = revert). A form plays the
+/// drive-start motion; the task swaps the object.
+pub fn start_change(game: &mut Game, form: u8) {
+    let Some(d) = game.drive.as_mut() else { return };
+    if form == d.form {
+        return;
+    }
+    let airborne = game.sora.player.in_air();
+    if form != 0 {
+        if game.clips.drive.is_some() {
+            game.sora.player.start_drive();
+            game.action_started = game.tick;
+        }
+        d.start_load(form);
+        // FUN_1403f6f80 / FUN_1403f76e0: the grey overlay, 12 frames in.
+        d.overlay_step = 1. / OVERLAY_IN;
+        // FUN_140400b20: the members the form takes leave the field.
+        let mut leaving = Vec::new();
+        for (i, m) in game.party.iter_mut().enumerate() {
+            if !m.stored && forms::absorbs(form, u16::from(m.kind.character)) {
+                m.stored = true;
+                m.follower.attack = None;
+                leaving.push((i, 0));
+            }
+        }
+        d.stored.extend(leaving);
+    }
+    d.form = form;
+    game.sound_queue.push(if form != 0 {
+        (SE_DRIVE, "drive_start")
+    } else {
+        (SE_REVERT, "revert")
+    });
+    let Some(d) = game.drive.as_mut() else { return };
+    d.change = Some(Change {
+        target: form,
+        frames: 0,
+        airborne,
+    });
+}
+
+/// FUN_140405440 case 4: roll, pay the result's cost, change.
+fn execute(game: &mut Game, requested: u8) {
+    let Some(d) = game.drive.as_mut() else { return };
+    let members = d.members();
+    let src = Arc::clone(&d.src);
+    let final_cost = src.command(forms::FINAL).map_or(5, |c| c.cost);
+    let ctx = forms::RollContext {
+        disabled: false,
+        abilities: &game.sora.player.abilities,
+        area_anti: 1,
+        battle: d.battle.on,
+        anti_party: forms::party_requirement(forms::ANTI, &members, 1.),
+        final_party: forms::party_requirement(forms::FINAL, &members, 1.),
+        final_owned: d.forms.owned[forms::FINAL as usize],
+        // The room has no story progress (flag 0x4842 clear).
+        final_story: false,
+        final_cost,
+        level: game.sora.player.drive.level,
+    };
+    let rolled = d.forms.roll(requested, &ctx, &src.fmlv, &mut d.seed);
+    let cost = src.command(rolled.form).map_or(0, |c| c.cost);
+    game.sora.player.drive.pay(cost);
+    let tick = game.tick;
+    game.event(
+        serde_json::json!({"event":"drive","tick":tick,"requested":requested,
+        "form":rolled.form,"final_obtained":rolled.final_obtained,"cost":cost,
+        "anti_counter":game.drive.as_ref().map(|d| d.forms.records[5].exp)}),
+    );
+    start_change(game, rolled.form);
+}
+
+/// Exchanges the room's active kit for `form`'s.
+fn swap_kit(game: &mut Game, form: u8) -> Result<(), String> {
+    let d = game.drive.as_mut().ok_or("no drive state")?;
+    let incoming = match d.stash.remove(&form) {
+        Some(s) => s,
+        None => {
+            let weight = d.src.object(form).map_or(100., |o| o.weight());
+            let kit = d.ready.remove(&form).ok_or("form kit not loaded")?;
+            let n = if kit.weapon_motions == 0 {
+                0
+            } else if kit.clip_poses.iter().any(|c| !c.weapon2.is_empty()) {
+                2
+            } else {
+                1
+            };
+            d.weapons.insert(form, n);
+            d.models.insert(form, (kit.actor, kit.weapon, kit.weapon2));
+            match kit.pax {
+                Some(p) => d.paxes.insert(form, Arc::new(p)),
+                None => d.paxes.remove(&form),
+            };
+            d.script_events.insert(form, kit.script_events);
+            Stash {
+                blade: kit.blades,
+                weapon_pax: kit.weapon_pax.map(Arc::new),
+                weapon2_pax: kit.weapon2_pax.map(Arc::new),
+                target_shape: kit.target_shape,
+                params: kit.params,
+                clips: kit.clips,
+                poses: kit.actions.into_iter().collect(),
+                clip_poses: Arc::new(kit.clip_poses),
+                body: kit.body,
+                attack: kit.attack,
+                obj_shapes: kit.obj_shapes,
+                weight,
+            }
+        }
+    };
+    let shown = d.shown;
+    d.previous_shown = shown;
+    // The swings' blade spheres follow the kit (the room Keyblade's map test
+    // and, when there is an enemy, its hit test).
+    let blade = std::mem::replace(&mut game.wall.blades, incoming.blade.clone());
+    if let Some(rt) = game.enemy.as_mut() {
+        rt.blade = incoming.blade.clone();
+    }
+    let body = game
+        .enemy
+        .as_mut()
+        .map(|rt| std::mem::replace(&mut rt.sora_body, incoming.body.clone()))
+        .unwrap_or_default();
+    let outgoing = Stash {
+        target_shape: std::mem::replace(&mut game.player_target_shape, incoming.target_shape),
+        params: std::mem::replace(&mut game.params, incoming.params),
+        clips: std::mem::replace(&mut game.clips, incoming.clips),
+        poses: std::mem::replace(&mut game.poses, incoming.poses),
+        clip_poses: std::mem::replace(&mut game.clip_poses, incoming.clip_poses),
+        body,
+        attack: std::mem::replace(&mut game.sora_attack, incoming.attack),
+        blade,
+        weapon_pax: std::mem::replace(&mut game.weapon_pax, incoming.weapon_pax),
+        weapon2_pax: std::mem::replace(&mut game.weapon2_pax, incoming.weapon2_pax),
+        obj_shapes: std::mem::replace(&mut game.sora_obj_shapes, incoming.obj_shapes),
+        weight: std::mem::replace(&mut game.sora_weight, incoming.weight),
+    };
+    game.weapon_pax_changed = true;
+    // The change swaps the player object: its new weapons start hidden
+    // (FUN_1403d7c70, FUN_1403ef750).
+    game.sora.player.weapon = Default::default();
+    // The trail's length follows the new Keyblade's size.
+    game.trail_length = [None; 2];
+    // The new kit's attack rows (ATKP by id, sub-table 0) for the hits.
+    if let Some(rt) = game.enemy.as_mut() {
+        let ids: Vec<u16> = game
+            .clip_poses
+            .iter()
+            .flat_map(|c| c.hits.iter().chain(&c.hits2))
+            .map(|h| h.2)
+            .collect();
+        for id in ids {
+            if ensure_attack_rows(rt, id, 0)
+                && let Some(row) = rt.rows.get(&id).copied()
+            {
+                rt.hit_effects
+                    .entry(id)
+                    .or_insert((row.hit_effect, row.hit_effect_random));
+            }
+        }
+    }
+    let d = game.drive.as_mut().ok_or("no drive state")?;
+    d.stash.insert(shown, outgoing);
+    d.shown = form;
+    d.respawn = Some(form);
+    Ok(())
+}
+
+/// The swap and the new object's first frame (FUN_14040d000's body,
+/// FUN_1403c17c0, FUN_140405630).
+fn finish_change(game: &mut Game, abilities: Option<&[u16]>) -> Result<(), String> {
+    let change = game
+        .drive
+        .as_mut()
+        .and_then(|d| d.change.take())
+        .ok_or("no change")?;
+    let f = change.target;
+    swap_kit(game, f)?;
+    let airborne = change.airborne && game.sora.player.in_air();
+    let action = game.sora.player.arrive(f, airborne, &game.clips);
+    game.action_started = game.tick;
+    let _ = action;
+    let d = game.drive.as_mut().ok_or("no drive state")?;
+    // The old object's effects fade with it; a revert's new object starts
+    // elements 15..27 of its PAX (FUN_140405630).
+    d.fx_owner_left = Some(d.previous_shown);
+    if f == 0
+        && let Some(p) = d.paxes.get(&0).cloned()
+    {
+        for id in 15..=27 {
+            d.fx_requests.push(drive_fx::FxRequest {
+                pax: p.clone(),
+                id,
+                owner: 0,
+            });
+        }
+    }
+    if f != 0 {
+        d.active = true;
+        if f == forms::ANTI {
+            game.sound_queue.push((SE_ANTI, "antiform"));
+        }
+        let Some(d) = game.drive.as_mut() else {
+            return Err("no drive state".into());
+        };
+        let level = d.forms.record(f).map_or(1, |r| r.level);
+        // FUN_1403c17c0: HP and MP to full, an MP charge cancelled, the
+        // form's bars.
+        game.sora.player.mp.cur = game.sora.player.mp.max;
+        game.sora.player.mp.remaining = 0.;
+        game.sora.player.mp.total = 0.;
+        game.sora.player.mp_charging = false;
+        game.sora.player.drive.enter_form(f, level);
+        if game.enemy.is_some() {
+            let v = &mut game.sora.vitals;
+            v.hp = v.target.max_hp;
+        }
+    } else {
+        d.active = false;
+        game.sora.player.drive.leave_form();
+        members_return(game);
+    }
+    game.sora.player.shoot = f == forms::WISDOM;
+    rebuild_abilities(game, abilities);
+    let tick = game.tick;
+    let gauge = game.sora.player.drive;
+    game.event(
+        serde_json::json!({"event":"form_change","tick":tick,"form":f,
+        "bars":gauge.bars,"time":gauge.time,"drive_level":gauge.level}),
+    );
+    Ok(())
+}
+
+/// FUN_140400440: the absorbed members come back around Sora.
+fn members_return(game: &mut Game) {
+    let Some(d) = game.drive.as_mut() else { return };
+    let stored = std::mem::take(&mut d.stored);
+    let (mut seed, mut sector) = (d.seed, d.sector);
+    for (i, _) in stored {
+        let spot = forms::return_spot(
+            &game.world,
+            game.sora.player.position,
+            &mut seed,
+            &mut sector,
+        );
+        if let Some(m) = game.party.get_mut(i) {
+            m.stored = false;
+            m.follower.position = spot.0;
+            m.follower.yaw = spot.1;
+            m.follower.attack = None;
+        }
+    }
+    if let Some(d) = game.drive.as_mut() {
+        (d.seed, d.sector) = (seed, sector);
+    }
+}
+
+/// Ends the swapped-in Sora's form now, with no motion or effect of its own
+/// (a duel round's end [the owner's request]; a door keeps the
+/// form): no change running, no afterimage or grey overlay, no bullets, the base
+/// kit shown, the gauge in Drive mode and the form's abilities gone. The
+/// form's effects fade through `fx_owner_left`.
+pub fn end_form(game: &mut Game) {
+    let Some(d) = game.drive.as_mut() else { return };
+    let changing = d.change.is_some();
+    d.change = None;
+    d.request = None;
+    d.limit_request = None;
+    d.after = None;
+    d.overlay = 0.;
+    d.overlay_step = 0.;
+    d.fx_requests.clear();
+    d.end_shots();
+    let in_form = d.shown != 0 || d.active;
+    if !in_form && !changing {
+        return;
+    }
+    members_return(game);
+    show_form(game, 0);
+    let p = &mut game.sora.player;
+    p.drive.leave_form();
+    p.shoot = false;
+    if !p.dead() {
+        let airborne = p.in_air();
+        p.arrive(0, airborne, &game.clips);
+        game.action_started = game.tick;
+    }
+    rebuild_abilities(game, None);
+    let tick = game.tick;
+    game.event(serde_json::json!({"event":"form_ended","tick":tick}));
+}
+
+/// The duel's joiner: shows the form the host's snapshot names (its kit
+/// once loaded, the model with it), without the change's own steps (the
+/// host ran those). Returns false while the kit still loads.
+pub fn show_form(game: &mut Game, form: u8) -> bool {
+    let Some(d) = game.drive.as_mut() else {
+        return true;
+    };
+    d.form = form;
+    d.active = form != 0;
+    if d.shown == form {
+        return true;
+    }
+    let mut log = Vec::new();
+    if !matches!(d.loaded(form, &mut log), Ok(true)) && form != 0 {
+        return false;
+    }
+    if swap_kit(game, form).is_err() {
+        return false;
+    }
+    // The old object's effects fade with it, on this instance too.
+    if let Some(d) = game.drive.as_mut() {
+        d.fx_owner_left = Some(d.previous_shown);
+    }
+    game.sora.player.shoot = form == forms::WISDOM;
+    true
+}
+
+/// FUN_1404014a0 with the active form's record linked: Sora's support
+/// abilities, then the form's 24 slots.
+pub fn rebuild_abilities(game: &mut Game, sora: Option<&[u16]>) {
+    if let Some(s) = sora {
+        game.ability_slots = s.iter().copied().take(80).collect();
+        game.ability_slots.resize(80, 0);
+    }
+    let form = game
+        .drive
+        .as_ref()
+        .filter(|d| d.active)
+        .and_then(|d| d.forms.record(d.form))
+        .copied();
+    game.sora.player.abilities =
+        game.ability_source
+            .build_with_form(&game.ability_slots, &game.equipment, form.as_ref());
+    // FUN_1403c1d90 rebuilds the stat totals and the abilities together.
+    game.refresh_gear();
+}
+
+/// Form EXP for Sora (FUN_1403e8380), with level-ups' ability changes
+/// applied to Sora's slots.
+pub fn add_form_exp(game: &mut Game, amount: i32, sora: Option<&mut Vec<u16>>) {
+    let Some(d) = game.drive.as_mut() else { return };
+    if !d.active || amount <= 0 {
+        return;
+    }
+    let f = d.form;
+    let slots: &mut Vec<u16> = match sora {
+        Some(s) => s,
+        None => &mut game.ability_slots,
+    };
+    let src = Arc::clone(&d.src);
+    let ups = d.forms.add_exp(f, amount, &src.fmlv, slots, false);
+    for up in &ups {
+        if let Some(a) = up.ability {
+            // FUN_1403c3f00(ability, 1): into Sora's first empty slot.
+            if let Some(s) = slots.iter_mut().find(|s| **s == 0) {
+                *s = a;
+            }
+        }
+    }
+    if ups.is_empty() {
+        return;
+    }
+    let snapshot = slots.clone();
+    d.level_ups.extend(&ups);
+    // FUN_1403ed390: system effect 16 on Sora.
+    if let Some(p) = d.src.system_pax.clone() {
+        d.fx_requests.push(drive_fx::FxRequest {
+            pax: p,
+            id: 16,
+            owner: 0xff,
+        });
+    }
+    game.sound_queue.push((SE_FORM_LEVEL, "form_level"));
+    let tick = game.tick;
+    game.event(
+        serde_json::json!({"event":"form_level","tick":tick,"form":f,
+        "levels":ups.iter().map(|u| serde_json::json!({"level":u.level,"form_growth":u.form_growth,
+            "sora_growth":u.sora_growth,"ability":u.ability})).collect::<Vec<_>>()}),
+    );
+    rebuild_abilities(game, Some(&snapshot));
+}
+
+/// A rebuilt kit with the new Keyblades replaces the one on screen, once it
+/// is loaded and no form change runs (the duel's joiner calls it alone).
+pub fn rebuild_weapons(game: &mut Game) {
+    let Some(d) = game.drive.as_mut() else { return };
+    if let Some(form) = d.reweapon
+        && d.change.is_none()
+    {
+        let mut log = Vec::new();
+        let ready = d.loaded(form, &mut log);
+        for entry in log {
+            game.event(entry);
+        }
+        match ready {
+            Ok(true) => {
+                if let Some(d) = game.drive.as_mut() {
+                    d.reweapon = None;
+                }
+                match swap_kit(game, form) {
+                    Ok(()) => {
+                        // The old kit swapped out is stale: not kept.
+                        if let Some(d) = game.drive.as_mut() {
+                            d.stash.remove(&form);
+                        }
+                        let tick = game.tick;
+                        game.event(
+                            serde_json::json!({"event":"keyblade_kit","tick":tick,"form":form}),
+                        );
+                        // A worn body starts standing: the old clip may not
+                        // be in its kit.
+                        if game.drive.as_mut().is_some_and(|d| {
+                            let worn = d.outfit_pending;
+                            d.outfit_pending = false;
+                            if worn && !d.outfit_quiet {
+                                d.outfit_result = Some("Outfit on".into());
+                            }
+                            worn
+                        }) {
+                            // A form keeps its motion: its kit's set is the same.
+                            let p = &mut game.sora.player;
+                            if !p.dead() && form == 0 {
+                                let airborne = p.in_air();
+                                p.arrive(0, airborne, &game.clips);
+                                game.action_started = game.tick;
+                            }
+                            let outfit = game.drive.as_ref().and_then(|d| d.outfit);
+                            game.event(
+                                serde_json::json!({"event":"outfit_on","tick":tick,"object":outfit}),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        game.event(serde_json::json!({"event":"keyblade_kit_error","error":e}))
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                if let Some(d) = game.drive.as_mut() {
+                    d.reweapon = None;
+                    if d.outfit_pending {
+                        d.outfit_pending = false;
+                        if !d.outfit_quiet {
+                            d.outfit_result = Some(format!("Outfit failed: {e}"));
+                        }
+                        // The kit on screen stays, so its rebuild must too.
+                        d.outfit = None;
+                        d.keyblades_changed(d.main_weapon);
+                    }
+                }
+                let outfit_error = game.drive.as_ref().and_then(|d| d.outfit_result.clone());
+                eprintln!("Kit rebuild failed: {e}");
+                game.event(
+                    serde_json::json!({"event":"keyblade_kit_error","error":e,"outfit":outfit_error}),
+                );
+            }
+        }
+    }
+}
+
+/// One frame of the Drive system after the player's tick: menu requests,
+/// the change task, the form gauge's drain and the automatic revert.
+pub fn tick(game: &mut Game, abilities: Option<&[u16]>) {
+    if game.drive.is_none() {
+        return;
+    }
+    rebuild_weapons(game);
+    let Some(d) = game.drive.as_mut() else { return };
+    // FUN_1403ab6f0's battle state.
+    let p = game.sora.player.position;
+    // [Duel rule] A duel is a battle throughout (Antiform can come, a form
+    // in Antiform cannot revert).
+    let target = game.versus
+        || game.enemy.as_ref().is_some_and(|rt| {
+            let e = rt.enemy.position;
+            rt.enabled
+                && !matches!(
+                    rt.enemy.current_act(),
+                    Some(shadow::ActKind::Leave | shadow::ActKind::Dead)
+                )
+                && ((e[0] - p[0]).powi(2) + (e[2] - p[2]).powi(2)).sqrt() < BATTLE_DISTANCE
+        });
+    d.battle.update(target);
+    // The party slots (FUN_1403c3270): Donald and Goofy when in the room;
+    // a member the form took is unavailable.
+    d.real_party = !game.party.is_empty();
+    d.slots = [0, 1].map(|k| {
+        game.party.get(k).map(|m| forms::Member {
+            character: u16::from(m.kind.character),
+            usable: !m.stored,
+        })
+    });
+    for s in &mut d.stored {
+        s.1 += 1;
+    }
+    // Unattended runs (between the camp visits): Limit Form at 7490, then
+    // Strike Raid and Infinity with MP refilled, each follow-up pressed as
+    // soon as it is offered.
+    // The magic tour casts in a form (`--magic-form`).
+    // Antiform comes from the roll: Light & Darkness (chance 100) on a
+    // Valor request in battle.
+    if game.magic_tour && game.magic_form != 0 {
+        let anti = game.magic_form == forms::ANTI;
+        // (Antiform waits for the enemy placed at tick 60: the battle.)
+        let at = if anti { 70 } else { 10 };
+        let tick = game.tick;
+        if tick == at - 5 {
+            game.sora.player.drive.refill();
+        }
+        if anti && tick == at - 1 {
+            game.sora.player.abilities.set(forms::LIGHT_AND_DARKNESS);
+        }
+        if tick == at {
+            d.request = Some(if anti { forms::VALOR } else { game.magic_form });
+        }
+        // [Tour setup] The form's time stays full: the tour outlasts it.
+        if d.active {
+            let g = &mut game.sora.player.drive;
+            g.time = g.max_time;
+        }
+    }
+    // [Test] `--soak`: a form in turn, each held then reverted.
+    if game.soak {
+        if let Some(form) = super::soak_tour::form_request(game.tick) {
+            if form != 0 {
+                game.sora.player.drive.refill();
+            }
+            d.request = Some(form);
+        }
+        if d.active {
+            let g = &mut game.sora.player.drive;
+            g.time = g.max_time;
+        }
+    }
+    if game.autoplay.is_some()
+        && game.ability_tour.is_none()
+        && !game.magic_tour
+        && !game.sephiroth_tour
+        && game.outfit_tour.is_none()
+    {
+        use player::limit_form::{INFINITY, STRIKE_RAID};
+        match game.tick {
+            7480 => game.sora.player.drive.refill(),
+            7490 => d.request = Some(forms::LIMIT),
+            7695 | 8055 => game.sora.player.mp.cur = game.sora.player.mp.max,
+            7700 => d.limit_request = Some(INFINITY),
+            8060 => d.limit_request = Some(STRIKE_RAID),
+            _ => {}
+        }
+    }
+    if game.limit_form_tour {
+        let tick = game.tick;
+        if super::limit_form_tour::place(tick) {
+            game.sora.player.mp.cur = game.sora.player.mp.max;
+            game.sora.player.mp_charging = false;
+            // [Tour setup] The form's time topped up too: the counter
+            // window's fight drains it.
+            game.sora.player.drive.time = game.sora.player.drive.max_time;
+            // [Tour setup] In front of the Shadow, facing it.
+            if let Some(rt) = game.enemy.as_ref() {
+                let e = rt.enemy.position;
+                game.sora.player.position = [e[0], e[1], e[2] + super::limit_form_tour::STAND_OFF];
+                game.sora.player.yaw = std::f32::consts::PI;
+            }
+        }
+        // [Tour setup] The Shadow fights in the counter window only, Sora
+        // close in front of it as it opens.
+        let window = super::limit_form_tour::COUNTER;
+        if tick == window.start || tick == window.end {
+            game.cheats.enemy_frozen = tick == window.end;
+        }
+        if tick == window.start
+            && let Some(rt) = game.enemy.as_ref()
+        {
+            let e = rt.enemy.position;
+            game.sora.player.position = [e[0], e[1], e[2] + super::limit_form_tour::CLOSE];
+            game.sora.player.yaw = std::f32::consts::PI;
+        }
+        if let Some(cmd) = super::limit_form_tour::limit(tick) {
+            d.limit_request = Some(cmd);
+        }
+    }
+    d.overlay = (d.overlay + d.overlay_step).clamp(0., 1.);
+    // The afterimage (drivefx-02 §3.4): the 42000 driver steps k; after
+    // the swap the task lives one loop tick and yield(2) more [I: 4].
+    if let Some((k, speed, left)) = d.after.as_mut() {
+        *k = (*k + *speed).clamp(0., 1.);
+        if *speed < 0. {
+            *left = left.saturating_sub(1);
+            if *left == 0 {
+                d.after = None;
+            }
+        }
+    }
+    if let Some(f) = d.request.take() {
+        if f == 0 {
+            if d.revert_usable() {
+                start_change(game, 0);
+            }
+        } else if d.selectable(f, &game.sora.player.drive) {
+            execute(game, f);
+        }
+    }
+    let Some(d) = game.drive.as_mut() else { return };
+    if let Some(c) = d.change.as_mut() {
+        c.frames += 1;
+        let target = c.target;
+        let frames = c.frames;
+        let mut log = Vec::new();
+        // T0+30: the afterimage on at full strength (drives only).
+        if target != 0 && frames == CHANGE_WAIT {
+            d.after = Some((1., 0., 0));
+        }
+        // A revert needs base Sora's kit, which a rebuild may have dropped.
+        let ready = if target == 0 {
+            d.loaded(0, &mut log)
+        } else if frames < CHANGE_WAIT {
+            Ok(false)
+        } else {
+            d.loaded(target, &mut log)
+        };
+        for v in log {
+            game.event(v);
+        }
+        // FUN_14040ce00: HP and MP +6 a frame until the swap.
+        if target != 0 {
+            game.sora.player.mp.cur = (game.sora.player.mp.cur + 6).min(game.sora.player.mp.max);
+            if game.enemy.is_some() {
+                let v = &mut game.sora.vitals;
+                v.hp = (v.hp + 6).min(v.target.max_hp);
+            }
+        }
+        // FUN_14040d000 waits for motion 0x34 only while a party member is
+        // still in the field (FUN_140400840): the stand-in party's
+        // remaining member for Valor, Wisdom and Limit [I: members that
+        // left count as gone].
+        let party_present = if game.party.is_empty() {
+            game.drive.as_ref().is_some_and(|d| {
+                d.party && matches!(target, forms::VALOR | forms::WISDOM | forms::LIMIT)
+            })
+        } else {
+            game.party.iter().any(|m| !m.stored)
+        };
+        match ready {
+            Ok(true)
+                if target == 0 || !party_present || game.sora.player.drive_done(&game.clips) =>
+            {
+                if target != 0
+                    && let Some(d) = game.drive.as_mut()
+                {
+                    d.overlay_step = -1. / OVERLAY_OUT;
+                }
+                if let Err(e) = finish_change(game, abilities) {
+                    eprintln!("Drive form change failed: {e}");
+                }
+                // The swap: lerp k 1 → 0 over 20 (speed −0.05).
+                if let Some(d) = game.drive.as_mut()
+                    && let Some(a) = d.after.as_mut()
+                {
+                    *a = (a.0, -0.05, 4);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // The form could not be built: stay as base Sora.
+                eprintln!("Drive form {target} not loaded: {e}");
+                let tick = game.tick;
+                game.event(serde_json::json!({"event":"form_load_failed","tick":tick,"form":target,"error":e}));
+                if let Some(d) = game.drive.as_mut() {
+                    d.change = None;
+                    d.after = None;
+                    d.form = d.shown;
+                    d.overlay_step = -1. / OVERLAY_OUT;
+                    // The members the form took stay with Sora.
+                    for (i, _) in std::mem::take(&mut d.stored) {
+                        if let Some(m) = game.party.get_mut(i) {
+                            m.stored = false;
+                        }
+                    }
+                }
+                game.sora
+                    .player
+                    .arrive(0, game.sora.player.in_air(), &game.clips);
+            }
+        }
+        return;
+    }
+    if !d.active {
+        return;
+    }
+    // FUN_1403a92c0: the form gauge drains every frame.
+    let (battle, boost, summon) = (
+        d.battle.on,
+        game.sora.player.abilities.form_boost,
+        game.sora.player.abilities.summon_boost,
+    );
+    game.sora.player.drive.drain_frame(battle, boost, summon);
+    // FUN_140404a40: at time 0, revert once the Revert command could run.
+    if game.sora.player.drive.time <= 0.
+        && !game.sora.player.dead()
+        && game.sora.player.can_command(&game.clips)
+    {
+        start_change(game, 0);
+    }
+}
+
+/// The 4th command row: "Drive" (colour 5 in a form or with no usable
+/// form) or "Revert" in a form.
+pub fn menu_row(game: &Game) -> Option<(Vec<u8>, usize, bool)> {
+    let d = game.drive.as_ref()?;
+    if d.active || d.change.is_some() {
+        let colour = if d.revert_usable() { 0 } else { 5 };
+        Some((d.src.revert_label.clone(), colour, false))
+    } else {
+        let any = d.menu(&game.sora.player.drive).iter().any(|m| m.2 < 4);
+        let colour = if d.forms.owned[1..6].iter().any(|&o| o) {
+            if any { 0 } else { 1 }
+        } else {
+            5
+        };
+        Some((d.src.drive_label.clone(), colour, true))
+    }
+}
+
+/// Slot 1's hand (Valor, Master and Final's second Keyblade) and its
+/// model parts.
+#[derive(Component)]
+pub struct SecondHand;
+#[derive(Component)]
+pub struct SecondPart(usize);
+
+/// Rebuilds Sora's model after a kit swap, and poses the second Keyblade.
+#[allow(clippy::too_many_arguments)]
+pub fn present(
+    mut commands: Commands,
+    mut game: ResMut<Game>,
+    roots: Query<Entity, With<SoraRoot>>,
+    hands: Query<Entity, (With<WeaponRoot>, Without<SoraRoot>)>,
+    parts: Query<Entity, ModelParts>,
+    mut seconds: Query<(Entity, &mut Transform, &mut Visibility), With<SecondHand>>,
+    second_parts: Query<(&SecondPart, &Mesh3d)>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<FogMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let Some(form) = game.drive.as_mut().and_then(|d| d.respawn.take()) else {
+        // The second Keyblade follows slot 1's joint.
+        let clip = game.poses[&game.sora.player.pose_key()];
+        let frame = game.sora.player.motion_frame(&game.clips) as usize;
+        let cp = &game.clip_poses[clip];
+        let hands = &cp.weapon2;
+        if !second_parts.is_empty()
+            && let Some(pose) = cp.weapon_frame(1, frame)
+        {
+            for (part, handle) in &second_parts {
+                let positions = game.weapon2_indices[part.0]
+                    .iter()
+                    .map(|&i| pose[i as usize].to_array());
+                visual::room::set_positions(&mut meshes, &handle.0, positions);
+            }
+        }
+        for (_, mut t, mut v) in &mut seconds {
+            if let Some(m) = hands.get(frame.min(hands.len().saturating_sub(1))) {
+                *t = Transform::from_matrix(*m);
+            }
+            *v = if game.sora.player.weapon.shown && !hands.is_empty() {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
+        }
+        return;
+    };
+    let (Ok(root), Ok(hand)) = (roots.single(), hands.single()) else {
+        return;
+    };
+    for e in &parts {
+        commands.entity(e).despawn();
+    }
+    for (e, ..) in &seconds {
+        commands.entity(e).despawn();
+    }
+    let g = &mut *game;
+    let Some(d) = g.drive.as_ref() else { return };
+    let Some((actor, weapon, weapon2)) = d.models.get(&form) else {
+        return;
+    };
+    let count = d.weapons.get(&form).copied().unwrap_or(1);
+    let pose = g.clip_poses[g.poses[&(Action::Idle, false)]].frame(0);
+    let mut part_indices = Vec::new();
+    for (ordinal, entity) in spawn_model(
+        &mut commands,
+        actor,
+        &pose,
+        root,
+        &mut meshes,
+        &mut materials,
+        &mut images,
+    ) {
+        part_indices.push(actor.parts[ordinal].indices.clone());
+        if let Some(entity) = entity {
+            commands.entity(entity).insert(SoraPart(ordinal));
+        }
+    }
+    // As in setup: the weapon's own motion poses it in the hand joint's
+    // space; without one its bind pose is moved into its root joint's.
+    let battle_idle = &g.clip_poses[g.poses[&(Action::Idle, true)]];
+    let weapon_pose: Vec<Vec3> = if let Some(pose) = battle_idle.weapon_frame(0, 0) {
+        pose
+    } else {
+        let weapon_root =
+            Mat4::from_cols_array(&weapon.poses[0].matrix_bits[0].map(f32::from_bits));
+        weapon.poses[0]
+            .position_bits
+            .iter()
+            .map(|p| {
+                weapon_root
+                    .inverse()
+                    .transform_point3(Vec3::from_array(p.map(f32::from_bits)))
+            })
+            .collect()
+    };
+    // Slot 1's Keyblade is posed by its own motion at the same key time.
+    let weapon2_pose = battle_idle
+        .weapon_frame(1, 0)
+        .unwrap_or_else(|| weapon_pose.clone());
+    let mut hands_to_fill = Vec::new();
+    if count >= 1 {
+        hands_to_fill.push(hand);
+    }
+    if count >= 2 {
+        let e = commands
+            .spawn((
+                SecondHand,
+                ChildOf(root),
+                Transform::default(),
+                Visibility::Hidden,
+            ))
+            .id();
+        hands_to_fill.push(e);
+    }
+    let mut weapon_indices = Vec::new();
+    let mut weapon2_indices = Vec::new();
+    for (k, &h) in hands_to_fill.iter().enumerate() {
+        let (model, pose) = if k == 0 {
+            (weapon, &weapon_pose)
+        } else {
+            (weapon2.as_ref().unwrap_or(weapon), &weapon2_pose)
+        };
+        for (ordinal, entity) in spawn_model(
+            &mut commands,
+            model,
+            pose,
+            h,
+            &mut meshes,
+            &mut materials,
+            &mut images,
+        ) {
+            if k == 0 {
+                weapon_indices.push(model.parts[ordinal].indices.clone());
+            } else {
+                weapon2_indices.push(model.parts[ordinal].indices.clone());
+            }
+            if let Some(entity) = entity {
+                if k == 0 {
+                    commands.entity(entity).insert(WeaponPart(ordinal));
+                } else {
+                    commands.entity(entity).insert(SecondPart(ordinal));
+                }
+            }
+        }
+    }
+    g.part_indices = part_indices;
+    g.weapon_indices = weapon_indices;
+    g.weapon2_indices = weapon2_indices;
+    g.display = pose;
+    g.weapon_display = weapon_pose;
+    g.blend_from = None;
+    g.display_joints.clear();
+    g.blend_from_joints.clear();
+    g.display_chains.clear();
+    g.blend_from_chains.clear();
+    g.shown_action = None;
+}
+
+/// Wisdom Form's Shoot: frame trigger 1 of the attack motion fires a
+/// bullet (`player::wisdom_form`); live bullets fly and join the spell
+/// volumes, and a bullet that hit is removed.
+pub fn shots(game: &mut Game) {
+    // The muzzle: shot elements 25..43 bind to bone 0x4003, the Keyblade's
+    // tip, and the bullet starts at their first position (BindOnlyStart).
+    let tip = super::drive_fx::blade_tip(game, 0);
+    let Game {
+        drive,
+        sora: Fighter { player, .. },
+        clips,
+        magic,
+        enemy,
+        fx_queue,
+        ..
+    } = game;
+    let (Some(d), Some(m)) = (drive.as_mut(), magic.as_mut()) else {
+        return;
+    };
+    let hits = &m.last_hits;
+    for b in d.bullets.iter().filter(|b| hits.contains(&b.key)) {
+        d.bullet_ends.push((b.key, false));
+    }
+    d.bullets.retain(|b| !hits.contains(&b.key));
+    if d.active && d.form == forms::WISDOM && d.change.is_none() {
+        let clip = player.clip(clips);
+        if matches!(player.action, Action::Attack(_) | Action::AirAttack(_)) {
+            for &(f, n) in &clip.effects {
+                if !player.passed(f) {
+                    continue;
+                }
+                let Some(sub) = player::wisdom_form::shot_sub(n) else {
+                    continue;
+                };
+                d.bullet_serial += 1;
+                let p = player.position;
+                let muzzle = tip.map_or([p[0], p[1] + m.src.target_lift, p[2]], |t| t.to_array());
+                let dir = [player.yaw.sin(), 0., player.yaw.cos()];
+                let key = BULLET_KEYS | d.bullet_serial;
+                d.bullets
+                    .push(player::wisdom_form::Bullet::new(key, sub, muzzle, dir));
+                // Its visual: MAGF element 20, unbound, on the bullet.
+                if let Some(pax) = d.paxes.get(&forms::WISDOM).cloned() {
+                    fx_queue.push(super::drive_fx::Placed {
+                        req: super::drive_fx::FxRequest {
+                            pax,
+                            id: BULLET_ELEMENT,
+                            owner: forms::WISDOM,
+                        },
+                        anchor: super::drive_fx::Anchor::Bullet(key),
+                    });
+                }
+            }
+        }
+    }
+    let target = enemy
+        .as_ref()
+        .filter(|rt| rt.enemy.targetable())
+        .and_then(|rt| enemy_targets(rt).first().map(|t| t.centre));
+    let ends = &mut d.bullet_ends;
+    d.bullets.retain_mut(|b| {
+        // A bullet its own layer steers.
+        let bolt = (super::hooks().steers_bullet)(b.key);
+        let live = b.step(if bolt { None } else { target });
+        if !live {
+            ends.push((b.key, true));
+        }
+        live
+    });
+    // A bolt still in its ring (not launched) hits nothing.
+    for b in d.bullets.iter().filter(|b| b.speed > 0.) {
+        m.volumes.push(player::magic::Volume {
+            key: b.key,
+            atkp: player::wisdom_form::ATKP,
+            sub: b.sub,
+            centre: b.pos,
+            radius: player::wisdom_form::RADIUS,
+            height: player::wisdom_form::RADIUS,
+            previous: b.previous(),
+            moving: Some(b.dir),
+            role: player::magic::Role::Damage,
+        });
+    }
+}
+
+/// Wisdom bullets' volume keys (below the spells' serial keys' range).
+const BULLET_KEYS: u64 = 1 << 60;
+/// MAGF's bullet element (formcmd §2.3).
+const BULLET_ELEMENT: u16 = 20;
+
+/// FUN_140400990: an absorbed member fades out over 15 frames and is
+/// then gone from view [the fade itself is not drawn: the member shows
+/// until the 15th frame].
+pub fn party_visibility(
+    game: Res<Game>,
+    mut roots: Query<(&party_room::PartyRoot, &mut Visibility)>,
+) {
+    for (root, mut v) in &mut roots {
+        // A form's absorbed members, and those a summon sent away
+        // (FUN_1403e6fa0).
+        let hidden = game.drive.as_ref().is_some_and(|d| {
+            d.stored
+                .iter()
+                .any(|&(i, frames)| i == root.0 && frames >= PARTY_FADE)
+        }) || game
+            .summon
+            .as_ref()
+            .is_some_and(|s| s.stored.contains(&root.0))
+            || game
+                .party_limit
+                .as_ref()
+                .is_some_and(|r| r.hides(root.0, game.tick));
+        let want = if hidden {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
+        if *v != want {
+            *v = want;
+        }
+    }
+}
+
+/// FUN_140400990's fade, in frames.
+const PARTY_FADE: u32 = 16;
+
+/// Frame trigger 1 of Sora's current motion (FUN_14040dd70 case 1): each
+/// trigger frame passed this tick starts that element of the shown kit's
+/// PAX, bound to him.
+pub fn motion_effects(game: &mut Game) {
+    let key = (game.action_started, game.sora.player.action);
+    let frame = game.sora.player.frame;
+    let clip = game.sora.player.clip(&game.clips).clone();
+    let dash = game.sora.player.quick_run_effect.take();
+    let Some(d) = game.drive.as_mut() else { return };
+    let from = match d.fx_scan {
+        Some((s, a, f)) if (s, a) == key => Some(f),
+        _ => None,
+    };
+    d.fx_scan = Some((key.0, key.1, frame));
+    let Some(pax) = d.paxes.get(&d.shown).cloned() else {
+        return;
+    };
+    // Quick Run's speed effect starts with the dash, bound to Sora
+    // (FUN_1403b6670 on his own effects).
+    if let Some(id) = dash {
+        d.fx_requests.push(drive_fx::FxRequest {
+            pax: pax.clone(),
+            id,
+            owner: d.shown,
+        });
+    }
+    for &(f, n) in &clip.effects {
+        let due = match from {
+            Some(prev) => f > prev && f <= frame,
+            None => f <= frame,
+        };
+        if due && n > 0 {
+            d.fx_requests.push(drive_fx::FxRequest {
+                pax: pax.clone(),
+                id: n as u16,
+                owner: d.shown,
+            });
+        }
+    }
+}
+
+/// Limit Form's limits: a requested limit starts (FUN_1403d8b40) on the
+/// object-script engine, its `limitform` program run as a party limit's
+/// scene (`party_limit`), which then ticks in place of Sora's update; the
+/// tint follows the limit's filter light and ramps out after it.
+pub fn limit_tick(game: &mut Game) {
+    let Some(d) = game.drive.as_mut() else { return };
+    d.tint_k = (d.tint_k + d.tint_step).clamp(0., 1.);
+    let request = d.limit_request.take();
+    if !d.limit_form() {
+        return;
+    }
+    let Some(cmd) = request else { return };
+    if game.party_limit.is_some() {
+        return;
+    }
+    let cost = d.src.commands.get(&cmd).map_or(0, |r| r.cost);
+    let colour = player::limit_form::colour(
+        cost,
+        false,
+        game.sora.player.mp.cur,
+        game.sora.player.mp_charging,
+    );
+    if colour >= 4 || !game.sora.player.can_command(&game.clips) {
+        return;
+    }
+    let tick = game.tick;
+    match super::party_limit::start(game, cmd, tick) {
+        Ok(()) => {
+            game.action_started = tick;
+            if let Some(d) = game.drive.as_mut() {
+                d.limit_running = true;
+            }
+            game.event(
+                serde_json::json!({"event":"limit_start","tick":tick,"cmd":cmd,"cost":cost}),
+            );
+        }
+        Err(e) => {
+            game.event(
+                serde_json::json!({"event":"limit_refused","tick":tick,"cmd":cmd,"error":e}),
+            );
+        }
+    }
+}
+
+/// Strike Raid's thrown Keyblade: while the `limitform` program has let it
+/// go (`obj_detach`, then `obj_set_pos` each frame of its `fly` thread) it
+/// is drawn where the scene holds its object, turned as the program's
+/// `obj_set_xyzrot` (from 6:68's angles) turns it: rolling about its travel.
+type HandQuery<'w, 's> = Query<
+    'w,
+    's,
+    (&'static mut Transform, &'static mut Visibility),
+    (With<WeaponRoot>, Without<SoraRoot>),
+>;
+
+pub fn thrown_keyblade(
+    game: Res<Game>,
+    roots: Query<&Transform, (With<SoraRoot>, Without<WeaponRoot>)>,
+    mut hands: HandQuery,
+    mut last: Local<Option<(Vec3, Vec3)>>,
+) {
+    let Some((at, axes)) = game
+        .party_limit
+        .as_ref()
+        .and_then(|r| r.thrown_weapon())
+        .map(|(p, axes)| (Vec3::from_array(p), axes))
+    else {
+        *last = None;
+        return;
+    };
+    let (Ok(root), Ok((mut t, mut v))) = (roots.single(), hands.single_mut()) else {
+        return;
+    };
+    let dir = match *last {
+        Some((p, d)) if p.distance_squared(at) < 1e-4 => d,
+        Some((p, _)) => (at - p).normalize_or(Vec3::Z),
+        None => Vec3::new(game.sora.player.yaw.sin(), 0., game.sora.player.yaw.cos()),
+    };
+    *last = Some((at, dir));
+    // The program's own turn when it set one, else along the travel.
+    let rotation = match axes {
+        Some([x, y, z]) => Quat::from_mat3(&Mat3::from_cols(
+            Vec3::from_array(x),
+            Vec3::from_array(y),
+            Vec3::from_array(z),
+        )),
+        None => Quat::from_rotation_arc(Vec3::NEG_X, dir),
+    };
+    let world = Transform {
+        translation: at,
+        rotation,
+        scale: Vec3::ONE,
+    };
+    *t = Transform::from_matrix(root.to_matrix().inverse() * world.to_matrix());
+    *v = Visibility::Inherited;
+}
+
+/// DAT_1405c5d08: the form items whose names title the panels.
+pub const FORM_ITEMS: [u16; 6] = [0x1a, 0x1b, 0x233, 0x1f, 0x1d, 0x1e];
+
+/// FUN_1403e8380's panels for one level: the form's (title = its item
+/// name, "Form Gauge Powered Up!", the new form ability) and Sora's (title
+/// "Sora", his growth ability and the bonus ability), skipped when empty.
+/// An ability line is `{icon}<name>!` (msg 0xae8); the icon glyph is not
+/// drawn [I: the system font here has no inline icons].
+pub fn level_panels(src: &FormSources, up: &forms::LevelUp) -> Vec<visual::level_up::Entry> {
+    let line = |item: u16| {
+        src.item_names.get(&item).map(|n| {
+            let mut v = n.clone();
+            v.push(0x48);
+            v
+        })
+    };
+    let title = FORM_ITEMS
+        .get(up.form as usize - 1)
+        .and_then(|i| src.item_names.get(i))
+        .cloned()
+        .unwrap_or_default();
+    let mut out = vec![visual::level_up::Entry {
+        kind: visual::level_up::Kind::Form,
+        form: up.form,
+        level: up.level,
+        title,
+        line1: src.gauge_up.clone(),
+        line2: up.form_growth.and_then(line),
+    }];
+    let sora: Vec<Vec<u8>> = [up.sora_growth, up.ability]
+        .into_iter()
+        .flatten()
+        .filter_map(line)
+        .collect();
+    if let Some(first) = sora.first() {
+        out.push(visual::level_up::Entry {
+            kind: visual::level_up::Kind::Form,
+            form: 0,
+            level: up.level,
+            title: src.sora_title.clone(),
+            line1: first.clone(),
+            line2: sora.get(1).cloned(),
+        });
+    }
+    out
+}
+
+/// Battle voices (FUN_1403d69b0 → FUN_1403cdb60): 00battle `vtbl` rows
+/// {u8 char, u8 n, u8 prio, u8 0, 5 × (i8 sound, i8 weight)} and the
+/// character's voice bank.
+#[derive(Clone)]
+pub struct Voices {
+    rows: Vec<[u8; 14]>,
+    bank: u16,
+    /// The voice pick's draws (the shared LCG DAT_140783ca0 [I: kept
+    /// apart here]).
+    seed: u32,
+    pub scan: Option<(u64, Action, u32)>,
+}
+
+impl Voices {
+    pub fn read(vtbl: &[u8], bank: u16) -> Option<Self> {
+        let count = u32::from_le_bytes(vtbl.get(4..8)?.try_into().ok()?) as usize;
+        let rows = (0..count.min(4096))
+            .map(|k| {
+                vtbl.get(8 + k * 14..22 + k * 14)
+                    .map(|r| r.try_into().unwrap())
+            })
+            .collect::<Option<Vec<[u8; 14]>>>()?;
+        Some(Voices {
+            rows,
+            bank,
+            seed: 1,
+            scan: None,
+        })
+    }
+
+    /// voice_pick(char, n): a weighted roll over the row's sounds (0..99),
+    /// else a uniform pick among the unweighted ones. Returns the sound
+    /// request id.
+    pub fn pick(&mut self, character: u8, n: i16) -> Option<u32> {
+        let row = *self
+            .rows
+            .iter()
+            .find(|r| r[0] == character && r[1] as i16 == n)?;
+        self.seed = self.seed.wrapping_mul(0x10dcd);
+        let mut r = (self.seed / 0x28f_5c29) as i32;
+        let mut cand = Vec::new();
+        for k in 0..5 {
+            let (idx, weight) = (row[4 + k * 2] as i8, row[5 + k * 2] as i8);
+            if idx < 0 {
+                continue;
+            }
+            if weight < 1 {
+                cand.push(idx);
+            } else {
+                r -= weight as i32;
+                if r < 0 {
+                    return Some(self.bank as u32 * 1000 + idx as u32);
+                }
+            }
+        }
+        if cand.is_empty() {
+            return None;
+        }
+        self.seed = self.seed.wrapping_mul(0x10dcd);
+        let len = cand.len() as u64;
+        let i = (self.seed as u64 / (1u64 << 32).div_ceil(len)) as usize;
+        Some(self.bank as u32 * 1000 + cand[i.min(cand.len() - 1)] as u32)
+    }
+}

@@ -1,0 +1,1837 @@
+//! Field areas for the test room: an area's map, ARD scripts, story
+//! programs and spawn points loaded by name from the selected install, as
+//! the exe's area loader does (FUN_140152680 → FUN_14039c860 →
+//! FUN_1403a2170; map names FUN_140161c50, ARD FUN_1403a2060).
+use crate::npcs::{FieldNpc, Lcg, NpcKind};
+use ::area::{
+    Area, PlayerProbe, Request, Spawn,
+    progress::{self, Progress},
+    script::{self, EventEntry, Location, ScriptRandom},
+    world_state::{self, WorldTables},
+};
+use bevy::prelude::Vec3;
+use collision::{Body, Query};
+use data::{
+    ard::{self, tag},
+    bar,
+    member_table::{self, MemberTable},
+    objentry,
+    path_lookup::Library,
+    probe_source::ProbeSource,
+    room_collision,
+};
+use std::{collections::HashMap, sync::Arc};
+use visual::{
+    dialogue::{self, Op},
+    hud,
+    room::{LoadedRoom, load_room_archive},
+};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Sora's map body: P_EX100.mdlx BAR type 23 entry 0 (kind 4, r 90, h 90,
+/// ph 115), collision class 0 (FUN_1403d5840) [collide-01 §2].
+pub const SORA_BODY: Body = Body {
+    radius: 90.,
+    height: 90.,
+    offset: 115.,
+    mode: 1,
+    class: 0,
+};
+
+/// How many worlds the world table has.
+pub const WORLD_COUNT: usize = progress::WORLDS.len();
+
+/// A world's two-letter code.
+pub fn world_code(world: u8) -> Option<&'static str> {
+    progress::WORLDS.get(world as usize).copied()
+}
+
+/// Debug-menu names of the worlds in `progress::WORLDS` order (rewrite
+/// labels, not game text); the code where none is known.
+pub fn world_name(world: u8) -> &'static str {
+    const NAMES: [&str; 19] = [
+        "zz",
+        "es",
+        "Twilight Town",
+        "Destiny Islands",
+        "Hollow Bastion",
+        "Beast's Castle",
+        "Olympus Coliseum",
+        "Agrabah",
+        "The Land of Dragons",
+        "100 Acre Wood",
+        "Pride Lands",
+        "Atlantica",
+        "Disney Castle",
+        "Timeless River",
+        "Halloween Town",
+        "World Map",
+        "Port Royal",
+        "Space Paranoids",
+        "The World That Never Was",
+    ];
+    NAMES.get(world as usize).copied().unwrap_or("?")
+}
+
+/// The installed files an area needs, opened once per session.
+pub struct AreaSource {
+    source: Arc<ProbeSource>,
+    library: Library,
+    progress: Progress,
+    /// 00objentry records and their index by object id.
+    objects: Vec<objentry::ObjectEntry>,
+    object_index: HashMap<u32, usize>,
+    /// Loaded townsperson models (kept across area changes) by objentry id.
+    pub kinds: Vec<NpcKind>,
+    kind_index: HashMap<u32, usize>,
+    /// Every kind's AI program by that index (a fork holds no older kinds).
+    kind_programs: Vec<crate::npcs::Program>,
+    /// Index of `kinds[0]` (nonzero in a fork, whose new kinds follow the
+    /// ones its parent already holds).
+    kind_base: usize,
+    rng: ScriptRandom,
+    /// Place names by (world, area) (msg/us/place.bin → sys.bar) and the
+    /// "???" shown for places not visited yet (sys 0x82b8).
+    place_names: HashMap<(u8, u8), Vec<u8>>,
+    /// Per world (index as in `progress::WORLDS`), the areas whose map is
+    /// installed.
+    rooms: Vec<Vec<u8>>,
+    /// 03system 'arif' (per-room table) and the BGM pair last started.
+    arif: Vec<u8>,
+    last_pair: Option<[u16; 2]>,
+    pub unknown_place: Vec<u8>,
+    /// Disable-reason texts by 'dsa' message word.
+    reasons: HashMap<u16, Vec<u8>>,
+    /// The ARD language directory (`*0x1408ec5d0`; "us" in this build).
+    language: &'static str,
+    /// 03system `cmd`: execute and argument by command.
+    commands: HashMap<u16, (u16, i16)>,
+    /// 07localset.bin (`data::world_map::read_program_areas`).
+    program_areas: Vec<Vec<(u16, u16)>>,
+    /// 03system `memt`.
+    members: MemberTable,
+    /// 03system `trsr`.
+    treasures: Vec<data::journal_table::Treasure>,
+}
+
+/// The object that offers a door between worlds or the like: a type-8 object
+/// with a reaction shape (FUN_140407de0) whose command raises a signal.
+#[derive(Clone, Copy, Debug)]
+pub struct Gate {
+    /// Scene position (Y up).
+    pub position: Vec3,
+    pub shape: data::object_collision::Entry,
+    pub command: u16,
+    pub signal: i32,
+}
+
+/// Where a signal's area entry sends the game (FUN_1403f60d0 → FUN_1403a46e0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignalJump {
+    /// Kind 1 by place, kind 2 by program id (FUN_1403a4bd0).
+    Field {
+        world: u8,
+        area: u8,
+        entrance: u8,
+        programs: [i16; 3],
+    },
+    /// Kind 4 (FUN_140154e20): the map, beside this world.
+    WorldMap(u8),
+}
+
+/// Reaction commands F_TR010 and the computer's F_EX000 raise these signals
+/// (FUN_1403aabe0 → FUN_1402e4570), which open the computers' menus
+/// (`tr_co.2ld`, `hb_co.2ld`, table 0x1405ba140). [Not built] Those menus are
+/// not drawn, so the signal stands for the first row's: 60, the first
+/// terminal in Hollow Bastion's Ansem's Study and Space Paranoids' way out.
+const COMPUTER_SIGNALS: [(i32, i32); 2] = [(0x57, 60), (0x58, 60)];
+
+/// Who the party is in an area: objects, Sora's first (FUN_140405190(0),
+/// FUN_1403c32e0).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Members {
+    pub player: u16,
+    pub friends: Vec<u16>,
+    /// `memt`'s result for the place: the object of each member type
+    /// (FUN_1403e2eb0, `DAT_142a25300`).
+    pub objects: Vec<u16>,
+    /// The world's member bytes (save +0x3534 + 4 × world) after the area's
+    /// op 0x0f, when it has one, starting from a new row.
+    pub record: Option<[u8; 4]>,
+    /// The op's presets: FUN_1403e31f0 applies them over the world's own row.
+    pub presets: Vec<u32>,
+}
+
+/// FUN_1403f60d0(signal, 0): the area's entry for the signal (an entry with no
+/// spawn id matches; the last such wins, as the exe's walk leaves it) and
+/// FUN_1403a4bd0's reading of its jump. An entry's event (FUN_1403ac350) is
+/// not played here.
+fn signal_jump(
+    events: &[EventEntry],
+    program_areas: &[Vec<(u16, u16)>],
+    signal: i32,
+) -> Option<SignalJump> {
+    let entry = events
+        .iter()
+        .find(|e| e.signal == signal && e.spawn_id == 0)
+        .or_else(|| {
+            events
+                .iter()
+                .rev()
+                .find(|e| e.signal == signal && e.spawn_id < 0)
+        })?;
+    entry_jump(entry, program_areas)
+}
+
+/// What firing an event entry (FUN_1403f61a0) leaves to its caller.
+pub struct Fired {
+    pub event: Option<(u32, i16)>,
+    pub flag: Option<i16>,
+}
+
+/// FUN_1403a4bd0's reading of an entry's jump: kinds 1, 2 and 4.
+fn entry_jump(entry: &EventEntry, program_areas: &[Vec<(u16, u16)>]) -> Option<SignalJump> {
+    let [kind, world, area, entrance, program, _] = entry.jump?;
+    match kind {
+        1 => Some(SignalJump::Field {
+            world: world as u8,
+            area: area as u8,
+            entrance: entrance as u8,
+            programs: [-1; 3],
+        }),
+        2 => {
+            let t = world_state::resolve_program(program_areas, world as u8, program as u16)?;
+            Some(SignalJump::Field {
+                world: t.world,
+                area: t.area,
+                entrance: entrance as u8,
+                programs: [program; 3],
+            })
+        }
+        4 => Some(SignalJump::WorldMap(world as u8)),
+        _ => None,
+    }
+}
+
+/// FUN_14039fbc0(0x7a, 2): where FUN_1403a46e0's redirect lands.
+fn redirect_target(program_areas: &[Vec<(u16, u16)>]) -> Option<SignalJump> {
+    let t = world_state::resolve_program(program_areas, 2, 0x7a)?;
+    Some(SignalJump::Field {
+        world: t.world,
+        area: t.area,
+        entrance: t.entrance,
+        programs: [0x7a; 3],
+    })
+}
+
+/// One loaded area.
+pub struct LoadedArea {
+    pub world: u8,
+    pub area: u8,
+    pub programs: [i16; 3],
+    /// Taken by the field when the area becomes current.
+    collision: Option<collision::World>,
+    pub state: Area,
+    /// Entities the scripts created.
+    #[allow(dead_code)]
+    pub spawns: Vec<Spawn>,
+    /// Music changes for this entry.
+    pub music: MusicChange,
+    /// Map objects (lamps, signs, clock) and their placements.
+    pub bobs: visual::scenery::LoadedBobs,
+    /// The townspeople of this area (objentry type 15, spawn types 0/1/3,
+    /// then zone-spawned ones as Sora enters their zones).
+    pub npcs: Vec<FieldNpc>,
+    /// The treasure chests of this area's spawns (objentry type 10).
+    pub chests: Vec<crate::chests::Chest>,
+    /// Spawn-type-2 townspeople waiting for their zone.
+    pub deferred: Vec<Deferred>,
+    /// Libretto scripts by talk id and their message texts.
+    pub scripts: HashMap<u16, Vec<Op>>,
+    pub lines: HashMap<u32, Vec<u8>>,
+    /// Player spawn in scene coordinates (Y up) and scene yaw.
+    pub player: (Vec3, f32),
+    /// The map's own effects (its first BAR entry of type 18, FUN_1401613c0).
+    pub pax: Option<Arc<data::object_effect::Pax>>,
+    /// The area's save points (spawns of the `SAVE_POINT` object, objentry
+    /// type 7): scene position (Y up) and the REACTION entry of its model's
+    /// collision table (command 0x37 "Save").
+    pub save_points: Vec<(Vec3, data::object_collision::Entry)>,
+    /// Each save point's object argument 1 (`obj+0x9f8`): the entrance a save
+    /// written there records (FUN_1403a8b10 case 0x37).
+    pub save_entrances: Vec<u8>,
+    /// Each save point is a WORLD_POINT (0x239), whose menu has the World Map
+    /// row, or a SAVE_POINT (0x23a) (FUN_1403a8b10, FUN_1402eb490).
+    pub world_points: Vec<bool>,
+    pub gates: Vec<Gate>,
+    /// Objects whose reaction opens a shop (`signal` is its id).
+    pub shops: Vec<Gate>,
+    /// The SHOP_POINTs among them: objentry id, scene position and yaw.
+    pub shop_points: Vec<(u16, Vec3, f32)>,
+    pub members: Members,
+    /// The save point object's effects (`obj/SAVE_POINT.a.us`) when the
+    /// area has save points.
+    pub save_point_pax: Option<Arc<data::object_effect::Pax>>,
+    /// The same of the WORLD_POINT object.
+    pub world_point_pax: Option<Arc<data::object_effect::Pax>>,
+}
+
+/// What the field and battle music slots must do on entering an area
+/// (FUN_140155840): `None` keeps the slot, `Some(None)` silences it,
+/// `Some(Some(bytes))` starts the new track.
+#[derive(Default)]
+pub struct MusicChange {
+    pub slots: [Option<Option<Vec<u8>>>; 2],
+    /// The area's field and battle track numbers.
+    pub pair: [u16; 2],
+}
+
+/// A zone-spawned townsperson (spawn type 2).
+pub struct Deferred {
+    pub spawn: Spawn,
+    pub kind: usize,
+    /// The NPC slot once spawned.
+    pub npc: Option<usize>,
+    /// Ticks since Sora left every zone of its point.
+    pub away: u32,
+}
+
+impl AreaSource {
+    /// Opens the indexes and sets story flags `first..=last` of the world in
+    /// ascending order (FUN_14039afc0 each), which fixes every area's
+    /// programs for that point of the story.
+    pub fn open(source: Arc<ProbeSource>, story: &[(u32, u32)]) -> Result<Self> {
+        let mut library = Library::open(&source)?;
+        let progress_bytes = library.read("00progress.bin")?;
+        let table = bar::read_bar(&progress_bytes)?;
+        let scripts = progress::WORLDS
+            .iter()
+            .map(|code| {
+                let mut name = [0u8; 4];
+                name[..2].copy_from_slice(code.as_bytes());
+                table
+                    .entries
+                    .iter()
+                    .find(|e| e.name_bytes == name)
+                    .and_then(|e| {
+                        progress_bytes
+                            .get(e.offset as usize..e.offset as usize + e.size as usize)
+                            .map(<[u8]>::to_vec)
+                    })
+            })
+            .collect();
+        let mut progress = Progress::new(scripts);
+        if let Some(e) = table.entries.iter().find(|e| e.name_bytes[..3] == *b"dsa")
+            && let Some(b) =
+                progress_bytes.get(e.offset as usize..e.offset as usize + e.size as usize)
+        {
+            progress.set_dsa(b);
+        }
+        // 00battle.bin 'btlv': what the story adds to each world's enemy level.
+        if let Some(rows) = library.read("00battle.bin").ok().and_then(|b| {
+            let table = data::bar::read_bar(&b).ok()?;
+            let e = table.entries.iter().find(|e| e.name_bytes == *b"btlv")?;
+            let bytes = b.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+            progress::read_battle_rows(bytes)
+        }) {
+            progress.set_battle_rows(rows);
+        }
+        // The world map tables (FUN_14039acd0, FUN_1403f1470, FUN_1403f2250):
+        // with them a flag set also runs the link table and marks world
+        // events, and a new game first runs world event 0 (FUN_1403df060).
+        if let (Ok(landing), Ok(points)) = (
+            library.read("70landing.bar"),
+            library.read("00worldpoint.bin"),
+        ) && let Ok(tables) = WorldTables::read(&progress_bytes, &landing, &points)
+        {
+            progress.set_world_tables(Arc::new(tables));
+            progress.start_world_events();
+        }
+        for &(first, last) in story {
+            for flag in first..=last {
+                if !progress.test(flag) {
+                    progress.set(flag);
+                }
+            }
+        }
+        // Every area is reachable: no story-blocked destination.
+        progress.unblock_all();
+        let objects = objentry::read(&library.read("00objentry.bin")?)?;
+        let object_index = objects
+            .iter()
+            .enumerate()
+            .map(|(i, o)| (o.object_id, i))
+            .collect();
+        // place.bin: per world (type-2 entry named by the world code) a
+        // table of {u16 message, u16 offset}, one record per area; the text
+        // is a sys.bar message.
+        let mut place_names = HashMap::new();
+        let mut unknown_place = Vec::new();
+        if let Ok(place) = library.read("msg/us/place.bin")
+            && let Ok(table) = bar::read_bar(&place)
+            && let Some(sys) = library.find("msg/us/sys.bar")
+        {
+            let mut keys = Vec::new();
+            let mut ids = Vec::new();
+            for (world, code) in progress::WORLDS.iter().enumerate() {
+                let Some(rows) = table
+                    .entries
+                    .iter()
+                    .find(|e| e.entry_type == 2 && e.name_bytes[..2] == *code.as_bytes())
+                    .and_then(|e| {
+                        place.get(e.offset as usize..e.offset as usize + e.size as usize)
+                    })
+                else {
+                    continue;
+                };
+                for (area, r) in rows.as_chunks::<4>().0.iter().enumerate() {
+                    keys.push((world as u8, area as u8));
+                    ids.push(u16::from_le_bytes([r[0], r[1]]) as u32);
+                }
+            }
+            ids.push(0x82b8);
+            if let Ok(texts) =
+                hud::load_messages_optional(&source, sys.index, sys.ordinal, sys.name_hash, &ids)
+            {
+                for (&key, t) in keys.iter().zip(&texts) {
+                    if let Some(t) = t {
+                        place_names.insert(key, t.clone());
+                    }
+                }
+                unknown_place = texts.last().cloned().flatten().unwrap_or_default();
+            }
+        }
+        let rooms = progress::WORLDS
+            .iter()
+            .map(|code| {
+                (0..progress::AREAS_PER_WORLD as u8)
+                    .filter(|n| library.find(&format!("map/{code}{n:02}.map")).is_some())
+                    .collect()
+            })
+            .collect();
+        let arif = library
+            .read("03system.bin")
+            .ok()
+            .and_then(|sys| {
+                let table = bar::read_bar(&sys).ok()?;
+                let e = table.entries.iter().find(|e| e.name_bytes == *b"arif")?;
+                sys.get(e.offset as usize..e.offset as usize + e.size as usize)
+                    .map(<[u8]>::to_vec)
+            })
+            .unwrap_or_default();
+        let members = library
+            .read("03system.bin")
+            .ok()
+            .and_then(|sys| {
+                let table = bar::read_bar(&sys).ok()?;
+                let e = table.entries.iter().find(|e| e.name_bytes == *b"memt")?;
+                let bytes = sys.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+                MemberTable::read(bytes).ok()
+            })
+            .unwrap_or_default();
+        let commands = library
+            .read("03system.bin")
+            .ok()
+            .and_then(|sys| {
+                let table = bar::read_bar(&sys).ok()?;
+                let e = table.entries.iter().find(|e| e.name_bytes == *b"cmd\0")?;
+                let bytes = sys.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+                data::command_table::read(bytes).ok()
+            })
+            .into_iter()
+            .flatten()
+            .map(|c| (c.id, (c.execute, c.argument)))
+            .collect();
+        let program_areas = library
+            .read("07localset.bin")
+            .ok()
+            .and_then(|b| data::world_map::read_program_areas(&b).ok())
+            .unwrap_or_default();
+        let treasures = library
+            .read("03system.bin")
+            .ok()
+            .and_then(|b| {
+                let table = data::bar::read_bar(&b).ok()?;
+                let e = table.entries.iter().find(|e| e.name_bytes == *b"trsr")?;
+                let bytes = b.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+                data::journal_table::read_treasures(bytes).ok()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            source,
+            library,
+            progress,
+            commands,
+            program_areas,
+            members,
+            treasures,
+            arif,
+            last_pair: None,
+            place_names,
+            rooms,
+            unknown_place,
+            reasons: HashMap::new(),
+            objects,
+            object_index,
+            kinds: Vec::new(),
+            kind_index: HashMap::new(),
+            kind_programs: Vec::new(),
+            kind_base: 0,
+            rng: ScriptRandom::default(),
+            language: "us",
+        })
+    }
+
+    /// A copy that loads the next area off the main thread: its own open
+    /// indexes and the same story, random and music state. `adopt` takes
+    /// the copy's state back once its load is done.
+    pub fn fork(&self) -> Result<Self> {
+        Ok(Self {
+            source: Arc::clone(&self.source),
+            library: Library::open(&self.source)?,
+            progress: self.progress.clone(),
+            objects: self.objects.clone(),
+            object_index: self.object_index.clone(),
+            kinds: Vec::new(),
+            kind_index: self.kind_index.clone(),
+            kind_programs: self.kind_programs.clone(),
+            treasures: self.treasures.clone(),
+            kind_base: self.kind_base + self.kinds.len(),
+            rng: self.rng,
+            place_names: HashMap::new(),
+            rooms: Vec::new(),
+            arif: self.arif.clone(),
+            last_pair: self.last_pair,
+            unknown_place: Vec::new(),
+            reasons: HashMap::new(),
+            language: self.language,
+            commands: self.commands.clone(),
+            program_areas: self.program_areas.clone(),
+            members: self.members.clone(),
+        })
+    }
+
+    /// Takes back a fork's state after it loaded an area: the townsperson
+    /// models it added, the script random state and the music pair.
+    pub fn adopt(&mut self, fork: Self) {
+        debug_assert_eq!(fork.kind_base, self.kind_base + self.kinds.len());
+        self.kinds.extend(fork.kinds);
+        self.kind_index = fork.kind_index;
+        self.kind_programs = fork.kind_programs;
+        self.rng = fork.rng;
+        self.last_pair = fork.last_pair;
+    }
+
+    /// FUN_140152be0 (programs from the save table) then the area loader.
+    /// `request` overrides the save table's programs where it is not −1
+    /// (FUN_140152be0).
+    pub fn load(
+        &mut self,
+        world: u8,
+        area: u8,
+        entrance: u8,
+        request: [i16; 3],
+    ) -> Result<(LoadedRoom, LoadedArea)> {
+        let code = progress::WORLDS
+            .get(world as usize)
+            .ok_or("world index outside the world table")?;
+        let name = format!("{code}{area:02}");
+        let mut timer = crate::load_timer::LoadTimer::new();
+        let map = self.library.read(&format!("map/{name}.map"))?;
+        let ard_bytes = self
+            .library
+            .read(&format!("ard/{}/{name}.ard", self.language))?;
+        let ard_bar = bar::read_bar(&ard_bytes)?;
+        timer.mark("area: map and ard read");
+        let entry = |kind: u16, name: u32| -> Option<&[u8]> {
+            ard_bar
+                .entries
+                .iter()
+                .find(|e| e.entry_type == kind && u32::from_le_bytes(e.name_bytes) == name)
+                .and_then(|e| ard_bytes.get(e.offset as usize..e.offset as usize + e.size as usize))
+        };
+        let mut programs = self.progress.programs(world, area);
+        for (p, r) in programs.iter_mut().zip(request) {
+            if r != -1 {
+                *p = r;
+            }
+        }
+        let location = Location {
+            world,
+            area,
+            entrance,
+            programs,
+        };
+        let scripts = ["map", "btl", "evt"].map(|n| entry(13, tag(n)));
+        let types: HashMap<u32, u8> = self
+            .objects
+            .iter()
+            .map(|o| (o.object_id, o.object_type))
+            .collect();
+        // The story point's map program; when it places no player at this
+        // entrance (an area its story state has not opened) the area's other
+        // map programs are tried in file order so every area can be entered.
+        let mut candidates = vec![location.programs[0]];
+        if let Some(group) = scripts[0]
+            && let Ok(ids) = ard::program_ids(group)
+        {
+            candidates.extend(ids.into_iter().filter(|&i| i != location.programs[0]));
+        }
+        let mut chosen = None;
+        for (n, &candidate) in candidates.iter().enumerate() {
+            let mut location = Location {
+                world,
+                area,
+                entrance,
+                programs: location.programs,
+            };
+            location.programs[0] = candidate;
+            let mut game = Flags(&self.progress);
+            let Ok(setup) = script::run(&location, scripts, &mut self.rng, &mut game) else {
+                continue;
+            };
+            let mut state = Area::new(world, area, entrance, setup, |n| {
+                entry(12, n).and_then(|d| ard::spawn_set(d).ok())
+            });
+            let spawns = state.activate(|id| types.get(&id).copied()).to_vec();
+            if Area::player_spawn(&spawns).is_some() || n + 1 == candidates.len() {
+                chosen = Some((state, spawns, location));
+                break;
+            }
+        }
+        let (state, spawns, location) = chosen.ok_or("area scripts did not run")?;
+        timer.mark("area: area scripts");
+        let programs = location.programs;
+        // The map's remaster images: its textures' (and its effects').
+        let replacements = self
+            .library
+            .read_map_replacements(&format!("map/{name}.map"))
+            .unwrap_or_default();
+        // The room and its map objects decode on a thread of their own while
+        // the townspeople and music load (neither reads the other).
+        let (room, bobs, npcs, deferred, scripts, lines, music) = std::thread::scope(|s| {
+            let scenery = s.spawn(|| {
+                let room = load_room_archive(&map, None, &replacements).map_err(|e| e.to_string());
+                let bobs = visual::scenery::load(&map, &replacements).unwrap_or_else(|e| {
+                    eprintln!("{name}: map objects not loaded: {e}");
+                    visual::scenery::LoadedBobs {
+                        models: Vec::new(),
+                        placements: Vec::new(),
+                    }
+                });
+                (room, bobs)
+            });
+            let (npcs, deferred, scripts, lines) =
+                self.townspeople(code, area, &state, &spawns, &types);
+            timer.mark("area: townspeople");
+            let music = self.music_change(world, area, state.setup.bgm);
+            timer.mark("area: music");
+            let (room, bobs) = scenery.join().expect("room thread");
+            (room, bobs, npcs, deferred, scripts, lines, music)
+        });
+        let room = room?;
+        timer.mark("area: room and map objects (alongside the townspeople)");
+        let collision = map_collision(&map, state.setup.bg_mask)?;
+        let pax = map_pax(&map, &replacements).map(Arc::new);
+        timer.mark("area: collision and map effects");
+        let save_points = self.save_points(&spawns);
+        let save_entrances = self.save_entrances(&spawns);
+        let world_points = self.world_points(&spawns);
+        let chests = self.chests(world, area, &spawns);
+        let gates = self.gates(code, &spawns, &state.setup.events);
+        // Every placement of the active points: a town's shopkeepers pop in by
+        // zone (spawn type 2), which `activate` passes over.
+        let placed: Vec<_> = state
+            .objects
+            .iter()
+            .filter(|o| !o.deferred)
+            .flat_map(|o| o.point.entities.iter())
+            .cloned()
+            .collect();
+        let shops = self.shops(&placed);
+        let shop_points = placed
+            .iter()
+            .filter(|e| {
+                self.object_index
+                    .get(&e.object)
+                    .is_some_and(|&i| self.objects[i].object_type == 0x14)
+            })
+            .map(|e| {
+                let [x, y, z] = e.position;
+                (
+                    e.object as u16,
+                    Vec3::new(x, -y, -z),
+                    std::f32::consts::PI - e.rotation[1],
+                )
+            })
+            .collect();
+        let members = self.members(world, area, &state.setup.party_set);
+        let save_point_pax = if save_points.is_empty() {
+            None
+        } else {
+            data::object_effect::read_file_pax(&mut self.library, "obj/SAVE_POINT.a.us")
+                .map(Arc::new)
+        };
+        let world_point_pax = if world_points.iter().any(|&w| w) {
+            data::object_effect::read_file_pax(&mut self.library, "obj/WORLD_POINT.a.us")
+                .map(Arc::new)
+        } else {
+            None
+        };
+        let player = Area::player_spawn(&spawns)
+            .map(|s| {
+                let [x, y, z] = s.entity.position;
+                // Engine yaw Y faces (sin Y, 0, cos Y); in the scene (x, −y,
+                // −z) that is (sin Y, −cos Y) = (sin φ, cos φ), φ = π − Y.
+                (Vec3::new(x, -y, -z), std::f32::consts::PI - s.yaw)
+            })
+            .ok_or_else(|| format!("{name} has no player spawn for entrance {entrance}"))?;
+        Ok((
+            room,
+            LoadedArea {
+                world,
+                area,
+                programs,
+                collision: Some(collision),
+                state,
+                spawns,
+                music,
+                bobs,
+                npcs,
+                chests,
+                deferred,
+                scripts,
+                lines,
+                player,
+                pax,
+                save_points,
+                save_entrances,
+                world_points,
+                gates,
+                shops,
+                shop_points,
+                members,
+                save_point_pax,
+                world_point_pax,
+            },
+        ))
+    }
+
+    /// The spawns of the `SAVE_POINT` object with the REACTION entry of its
+    /// model archive (`obj/SAVE_POINT.mdlx` holds only a collision table:
+    /// one kind-5 sphere, argument 0x37, centre 50 up, radius and height 50).
+    fn is_save_point(&self, id: u32) -> bool {
+        self.object_index.get(&id).is_some_and(|&i| {
+            let o = &self.objects[i];
+            o.object_type == 7
+                && (o.model_name.starts_with(b"SAVE_POINT")
+                    || o.model_name.starts_with(b"WORLD_POINT"))
+        })
+    }
+
+    fn world_points(&self, spawns: &[Spawn]) -> Vec<bool> {
+        spawns
+            .iter()
+            .filter(|s| self.is_save_point(s.entity.object))
+            .map(|s| {
+                self.object_index
+                    .get(&s.entity.object)
+                    .is_some_and(|&i| self.objects[i].model_name.starts_with(b"WORLD_POINT"))
+            })
+            .collect()
+    }
+
+    /// The spawns of type-10 objects, each on its `trsr` row (world, area,
+    /// entity arg1; FUN_140402200). A kind is read once per area.
+    fn chests(&mut self, world: u8, area: u8, spawns: &[Spawn]) -> Vec<crate::chests::Chest> {
+        use crate::chests::{Chest, ChestKind, ChestState};
+        let mut kinds: HashMap<u32, Arc<ChestKind>> = HashMap::new();
+        let mut out = Vec::new();
+        for s in spawns {
+            let id = s.entity.object;
+            let Some(&oi) = self.object_index.get(&id) else {
+                continue;
+            };
+            if self.objects[oi].object_type != 10 {
+                continue;
+            }
+            let kind = match kinds.get(&id) {
+                Some(k) => k.clone(),
+                None => {
+                    let object = self.objects[oi].clone();
+                    match ChestKind::load(&self.source, &mut self.library, &object) {
+                        Ok(k) => {
+                            let k = Arc::new(k);
+                            kinds.insert(id, k.clone());
+                            k
+                        }
+                        Err(e) => {
+                            eprintln!("Chest {id} not loaded: {e}");
+                            continue;
+                        }
+                    }
+                }
+            };
+            let row = crate::chests::row(&self.treasures, world, area, s.entity.arg1 as u8);
+            let [x, y, z] = s.entity.position;
+            out.push(Chest {
+                kind,
+                object: id,
+                position: Vec3::new(x, -y, -z),
+                yaw: s.yaw,
+                item: row.map(|r| r.item),
+                bit: row.map_or(0, |r| r.opened),
+                state: ChestState::Unread,
+            });
+        }
+        out
+    }
+
+    fn save_entrances(&self, spawns: &[Spawn]) -> Vec<u8> {
+        spawns
+            .iter()
+            .filter(|s| self.is_save_point(s.entity.object))
+            .map(|s| s.entity.arg1 as u8)
+            .collect()
+    }
+
+    fn save_points(&mut self, spawns: &[Spawn]) -> Vec<(Vec3, data::object_collision::Entry)> {
+        let points: Vec<Vec3> = spawns
+            .iter()
+            .filter(|s| self.is_save_point(s.entity.object))
+            .map(|s| {
+                let [x, y, z] = s.entity.position;
+                Vec3::new(x, -y, -z)
+            })
+            .collect();
+        if points.is_empty() {
+            return Vec::new();
+        }
+        let shape = self
+            .library
+            .read("obj/SAVE_POINT.mdlx")
+            .ok()
+            .and_then(|b| {
+                let table = data::bar::read_bar(&b).ok()?;
+                let e = table.entries.iter().find(|e| e.entry_type == 23)?;
+                let bytes = b.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+                data::object_collision::read(bytes).ok()
+            })
+            .and_then(|c| {
+                c.into_iter()
+                    .find(|e| e.kind == data::object_collision::REACTION)
+            });
+        match shape {
+            Some(e) => points.into_iter().map(|p| (p, e)).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The type-8 objects whose reaction raises a signal the area answers
+    /// with a jump: FUN_140407de0 offers the shape's command (0x83 names the
+    /// placement's own, entity +0x2c); FUN_1403a8b10's execute 0x1e runs the
+    /// placement's talk script (FUN_140400cd0, whose libretto op 3 raises the
+    /// signal) and execute 0x7f raises the command's argument.
+    fn gates(&mut self, code: &str, spawns: &[Spawn], events: &[EventEntry]) -> Vec<Gate> {
+        let mut out = Vec::new();
+        for s in spawns {
+            let Some(&i) = self.object_index.get(&s.entity.object) else {
+                continue;
+            };
+            let o = &self.objects[i];
+            if o.object_type != 8 {
+                continue;
+            }
+            let name = String::from_utf8_lossy(&o.model_name)
+                .trim_end_matches('\0')
+                .to_owned();
+            let shapes = self
+                .library
+                .read(&format!("obj/{name}.mdlx"))
+                .ok()
+                .and_then(|b| {
+                    let table = bar::read_bar(&b).ok()?;
+                    let e = table.entries.iter().find(|e| e.entry_type == 23)?;
+                    let bytes = b.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+                    data::object_collision::read(bytes).ok()
+                })
+                .unwrap_or_default();
+            for shape in shapes
+                .into_iter()
+                .filter(|e| e.kind == data::object_collision::REACTION)
+            {
+                let command = match shape.argument as u16 {
+                    0x83 => s.entity.reaction,
+                    c => c,
+                };
+                let signal = match self.commands.get(&command).copied() {
+                    Some((0x1e | 0x1f, _)) => self.talk_signal(code, s.entity.talk),
+                    Some((0x7f, argument)) => Some(i32::from(argument)),
+                    _ => None,
+                };
+                let Some(signal) = signal else { continue };
+                let signal = COMPUTER_SIGNALS
+                    .iter()
+                    .find(|(menu, _)| *menu == signal)
+                    .map_or(signal, |(_, row)| *row);
+                if self.signal_jump(events, signal).is_some() {
+                    let [x, y, z] = s.entity.position;
+                    out.push(Gate {
+                        position: Vec3::new(x, -y, -z),
+                        shape,
+                        command,
+                        signal,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// The shopkeepers (type 15) and SHOP_POINTs (0x14): their REACTION shape's
+    /// command raises one of FUN_1403aabe0's shop signals. These don't go to
+    /// `signal_jump`: the signal goes no further than the shop.
+    fn shops(&mut self, placed: &[ard::Entity]) -> Vec<Gate> {
+        let mut out = Vec::new();
+        for entity in placed {
+            let Some(&i) = self.object_index.get(&entity.object) else {
+                continue;
+            };
+            let o = &self.objects[i];
+            if !matches!(o.object_type, 15 | 0x14) {
+                continue;
+            }
+            let name = String::from_utf8_lossy(&o.model_name)
+                .trim_end_matches('\0')
+                .to_owned();
+            let shapes = self
+                .library
+                .read(&format!("obj/{name}.mdlx"))
+                .ok()
+                .and_then(|b| {
+                    let table = bar::read_bar(&b).ok()?;
+                    let e = table.entries.iter().find(|e| e.entry_type == 23)?;
+                    let bytes = b.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+                    data::object_collision::read(bytes).ok()
+                })
+                .unwrap_or_default();
+            for shape in shapes
+                .into_iter()
+                .filter(|e| e.kind == data::object_collision::REACTION)
+            {
+                let command = match shape.argument as u16 {
+                    0x83 => entity.reaction,
+                    c => c,
+                };
+                let Some((0x7f, argument)) = self.commands.get(&command).copied() else {
+                    continue;
+                };
+                let signal = i32::from(argument);
+                if matches!(signal, 0x13 | 0x66..=0x75 | 0x83..=0x85 | 0x8a) {
+                    let [x, y, z] = entity.position;
+                    out.push(Gate {
+                        position: Vec3::new(x, -y, -z),
+                        shape,
+                        command,
+                        signal,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Who the party is here: FUN_1403e2eb0's objects for the place, indexed
+    /// by the world's member bytes after the area's ARD op 0x0f
+    /// (FUN_1403e31f0). The bytes live in the save, world by world; with no
+    /// op in this area's programs and no save at hand they take preset 1
+    /// (Donald and Goofy) [I].
+    pub fn members(&self, world: u8, area: u8, party_set: &[u32]) -> Members {
+        let variant = self.command_variant(world, area);
+        let objects = self
+            .members
+            .objects(world, variant, |flag| self.progress.test(flag));
+        let mut record = member_table::NEW_RECORD;
+        let presets: Vec<u32> = if party_set.is_empty() {
+            self.members.presets.get(1).copied().into_iter().collect()
+        } else {
+            party_set
+                .iter()
+                .filter_map(|&p| self.members.presets.get(p as usize).copied())
+                .collect()
+        };
+        for &preset in &presets {
+            record = member_table::apply_preset(record, preset);
+        }
+        let object = |byte: u8| objects.get((byte & 0x1f) as usize).copied().unwrap_or(0);
+        Members {
+            objects: objects.to_vec(),
+            record: (!party_set.is_empty()).then_some(record),
+            presets,
+            player: object(record[0]),
+            friends: record[1..]
+                .iter()
+                .filter(|b| *b & 0x1f != member_table::NO_MEMBER)
+                .map(|&b| object(b))
+                .filter(|&o| o != 0)
+                .collect(),
+        }
+    }
+
+    /// A member preset of `memt`'s tail (sub-op 4's value).
+    pub fn member_preset(&self, index: usize) -> Option<u32> {
+        self.members.presets.get(index).copied()
+    }
+
+    /// An object's model name.
+    pub fn model_name(&self, object: u32) -> Option<String> {
+        let &i = self.object_index.get(&object)?;
+        Some(
+            String::from_utf8_lossy(&self.objects[i].model_name)
+                .trim_end_matches('\0')
+                .to_owned(),
+        )
+    }
+
+    /// The signal a talk script raises (libretto op 3), if any.
+    fn talk_signal(&mut self, code: &str, talk: u16) -> Option<i32> {
+        if talk == 0 {
+            return None;
+        }
+        let bytes = self.library.read(&format!("libretto-{code}.bar")).ok()?;
+        let table = bar::read_bar(&bytes).ok()?;
+        let e = table.entries.iter().find(|e| e.entry_type == 2)?;
+        let entry = bytes.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+        let count = i32::from_le_bytes(entry.get(4..8)?.try_into().ok()?).max(0) as usize;
+        (0..count).find_map(|r| {
+            let rec = entry.get(8 + r * 8..16 + r * 8)?;
+            if u16::from_le_bytes([rec[0], rec[1]]) != talk {
+                return None;
+            }
+            let at = u32::from_le_bytes(rec[4..8].try_into().ok()?) as usize;
+            dialogue::read_script(entry.get(at..)?)
+                .into_iter()
+                .find_map(|op| match op {
+                    Op::Signal(n) => Some(n as i32),
+                    _ => None,
+                })
+        })
+    }
+
+    pub fn signal_jump(&self, events: &[EventEntry], signal: i32) -> Option<SignalJump> {
+        self.redirect(signal_jump(events, &self.program_areas, signal))
+    }
+
+    pub fn entry_jump(&self, entry: &EventEntry) -> Option<SignalJump> {
+        self.redirect(entry_jump(entry, &self.program_areas))
+    }
+
+    /// FUN_1403a46e0: once flags 0x86e to 0x871 are all set and 0x872 isn't,
+    /// a jump to a place (kinds 1 to 3) lands on program 0x7a of world 2
+    /// instead.
+    pub fn redirect(&self, jump: Option<SignalJump>) -> Option<SignalJump> {
+        let p = &self.progress;
+        match jump {
+            Some(SignalJump::Field { .. })
+                if !p.test(0x872) && (0x86e..=0x871).all(|f| p.test(f)) =>
+            {
+                redirect_target(&self.program_areas).or(jump)
+            }
+            _ => jump,
+        }
+    }
+
+    /// FUN_1403f61a0: the entry's flag, if unset, with its script; the menu
+    /// flag; the entry is used up.
+    pub fn fire_entry(&mut self, events: &mut [EventEntry], index: usize) -> Fired {
+        let entry = &mut events[index];
+        entry.signal = -1;
+        let flag = entry.flag.filter(|&f| f >= 0);
+        if let Some(f) = flag
+            && !self.progress.test(f as u32)
+        {
+            self.progress.set(f as u32);
+        }
+        if let Some(f) = entry.e0c.filter(|&f| f >= 0) {
+            self.progress.set_menu_flag(f as u32);
+        }
+        Fired {
+            event: entry.event,
+            flag,
+        }
+    }
+
+    /// FUN_1403a5920: the room's command-layout digit, arif row byte +0x34
+    /// (0 outside the table).
+    pub fn command_variant(&self, world: u8, area: u8) -> u8 {
+        command_variant(&self.arif, world, area)
+    }
+
+    /// FUN_1403a5a80: the room's glow, arif row flag bit 4.
+    pub fn glow(&self, world: u8, area: u8) -> bool {
+        glow_flag(&self.arif, world, area)
+    }
+
+    /// FUN_140153ee0's file for a room: `<world><n>command.2dd`, or the
+    /// world-independent `zz0command.2dd` when the Config's command menu
+    /// is the default one (FUN_1402e5380: save config bit 6).
+    pub fn command_layout(&self, world: u8, area: u8, language: &str, default: bool) -> String {
+        command_layout(
+            progress::WORLDS
+                .get(world as usize)
+                .copied()
+                .unwrap_or("zz"),
+            self.command_variant(world, area),
+            language,
+            default,
+        )
+    }
+
+    /// The installed copy of `name`, and the source to read it from.
+    pub fn find(&self, name: &str) -> Option<(data::path_lookup::Found, &ProbeSource)> {
+        Some((self.library.find(name)?, &self.source))
+    }
+
+    /// The BGM pair of a room: the ARD override, else the arif row's pair
+    /// for the world's set index (FUN_1403a5960; bgm-input §A4).
+    fn bgm_pair(&self, world: u8, area: u8, ard: Option<[u16; 2]>) -> [u16; 2] {
+        if let Some(p) = ard {
+            return p;
+        }
+        let word = |o: usize| {
+            self.arif
+                .get(o..o + 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        };
+        let (count, off) = (word(8 + world as usize * 4), word(10 + world as usize * 4));
+        let (Some(count), Some(off)) = (count, off) else {
+            return [0, 0];
+        };
+        if area as u16 >= count {
+            return [0, 0];
+        }
+        let set = self.progress.arif_set[world as usize].max(0) as usize;
+        let at = off as usize + area as usize * 0x40 + 0x10 + set.min(7) * 4;
+        match (word(at), word(at + 2)) {
+            (Some(f), Some(b)) => [f, b],
+            _ => [0, 0],
+        }
+    }
+
+    fn music_change(&mut self, world: u8, area: u8, ard: Option<[u16; 2]>) -> MusicChange {
+        let pair = self.bgm_pair(world, area, ard);
+        let mut change = MusicChange::default();
+        for k in 0..2 {
+            let before = self.last_pair.map(|p| p[k]);
+            if before == Some(pair[k]) {
+                continue;
+            }
+            change.slots[k] = Some(if pair[k] == 0 {
+                None
+            } else {
+                self.library
+                    .read(&format!("bgm/music{:03}.win32.scd", pair[k]))
+                    .ok()
+            });
+        }
+        self.last_pair = Some(pair);
+        change.pair = pair;
+        change
+    }
+
+    /// The place name of an area (place.bin of its world).
+    pub fn place_name(&self, world: u8, area: u8) -> Option<&Vec<u8>> {
+        self.place_names.get(&(world, area))
+    }
+
+    /// The story state the area programs come from.
+    pub fn progress(&self) -> &Progress {
+        &self.progress
+    }
+
+    pub fn progress_mut(&mut self) -> &mut Progress {
+        &mut self.progress
+    }
+
+    /// The 00objentry record of an object id.
+    pub fn object(&self, id: u32) -> Option<&objentry::ObjectEntry> {
+        self.object_index.get(&id).map(|&i| &self.objects[i])
+    }
+
+    /// The installed areas of a world, in area order.
+    pub fn rooms(&self, world: u8) -> &[u8] {
+        self.rooms.get(world as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// FUN_1403f0560: destinations currently story-blocked ('dsa').
+    pub fn blocked_destinations(&self) -> Vec<(u8, u8)> {
+        self.progress.blocked_destinations()
+    }
+
+    /// FUN_1403f0470 → FUN_1403ad9a0: the disable-reason message of a
+    /// blocked destination; a word with no message falls back to sys 0xadc.
+    pub fn blocked_text(&mut self, world: u8, area: u8) -> Option<Vec<u8>> {
+        let word = self.progress.blocked(world, area)?;
+        if let Some(t) = self.reasons.get(&word) {
+            return Some(t.clone());
+        }
+        let sys = self.library.find("msg/us/sys.bar")?;
+        let texts = hud::load_messages_optional(
+            &self.source,
+            sys.index,
+            sys.ordinal,
+            sys.name_hash,
+            &[word as u32, 0xadc],
+        )
+        .ok()?;
+        let text = texts.into_iter().flatten().next()?;
+        self.reasons.insert(word, text.clone());
+        Some(text)
+    }
+
+    /// The (index, ordinal, hash) of an installed file for the HUD loaders.
+    pub fn locate(&self, name: &str) -> Option<(String, usize, [u8; 16])> {
+        self.library
+            .find(name)
+            .map(|f| (f.index.to_owned(), f.ordinal, f.name_hash))
+    }
+
+    /// Loads the townsperson kinds of `spawns` not loaded yet, on several
+    /// threads (each with its own library), and registers them in the order
+    /// they are first met. Returns the load errors by object id.
+    fn load_kinds<'a>(&mut self, spawns: impl Iterator<Item = &'a Spawn>) -> HashMap<u32, String> {
+        let mut missing: Vec<u32> = Vec::new();
+        for s in spawns {
+            let id = s.entity.object;
+            if let Some(&oi) = self.object_index.get(&id)
+                && self.objects[oi].object_type == 15
+                && !self.kind_index.contains_key(&id)
+                && !missing.contains(&id)
+            {
+                missing.push(id);
+            }
+        }
+        let (source, objects, object_index) = (&self.source, &self.objects, &self.object_index);
+        let loaded: Vec<std::result::Result<NpcKind, String>> = std::thread::scope(|scope| {
+            let threads: Vec<_> = missing
+                .iter()
+                .map(|id| {
+                    let object = &objects[object_index[id]];
+                    scope.spawn(move || {
+                        let mut library = Library::open(source).map_err(|e| e.to_string())?;
+                        NpcKind::load(source, &mut library, object).map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|t| t.join().expect("townsperson thread"))
+                .collect()
+        });
+        let mut failed = HashMap::new();
+        for (id, kind) in missing.into_iter().zip(loaded) {
+            match kind {
+                Ok(kind) => {
+                    self.kind_programs.push(kind.program);
+                    self.kinds.push(kind);
+                    self.kind_index
+                        .insert(id, self.kind_base + self.kinds.len() - 1);
+                }
+                Err(e) => {
+                    failed.insert(id, e);
+                }
+            }
+        }
+        failed
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn townspeople(
+        &mut self,
+        code: &str,
+        area: u8,
+        state: &Area,
+        spawns: &[Spawn],
+        types: &HashMap<u32, u8>,
+    ) -> (
+        Vec<FieldNpc>,
+        Vec<Deferred>,
+        HashMap<u16, Vec<Op>>,
+        HashMap<u32, Vec<u8>>,
+    ) {
+        let zone = state.zone_spawns(|id| types.get(&id).copied());
+        let failed = self.load_kinds(spawns.iter().chain(&zone));
+        // A townsperson whose kind did not load is left out (reported once
+        // per spawn, as before).
+        let kind_of = |this: &Self, s: &Spawn| -> Option<usize> {
+            let &oi = this.object_index.get(&s.entity.object)?;
+            if this.objects[oi].object_type != 15 {
+                return None;
+            }
+            let kind = this.kind_index.get(&s.entity.object).copied();
+            if kind.is_none()
+                && let Some(e) = failed.get(&s.entity.object)
+            {
+                eprintln!("NPC {} not loaded: {e}", s.entity.object);
+            }
+            kind
+        };
+        let mut random = Lcg(0x4b1d_0000 ^ (area as u32) << 8 ^ 0x2545);
+        let mut npcs = Vec::new();
+        for (i, s) in spawns.iter().enumerate() {
+            let Some(kind) = kind_of(self, s) else {
+                continue;
+            };
+            npcs.push(build_npc(
+                state,
+                kind,
+                s,
+                i,
+                self.kind_programs[kind],
+                &mut random,
+            ));
+        }
+        let mut deferred = Vec::new();
+        for s in zone {
+            let Some(kind) = kind_of(self, &s) else {
+                continue;
+            };
+            deferred.push(Deferred {
+                spawn: s,
+                kind,
+                npc: None,
+                away: 0,
+            });
+        }
+        // Talk scripts: libretto-<world>.bar type-2 entry (kh2_first #474 for
+        // tt): {u32 3, i32 count, count × {u16 talk, u16 kind, u32 offset}}.
+        let mut scripts = HashMap::new();
+        if let Ok(bytes) = self.library.read(&format!("libretto-{code}.bar"))
+            && let Ok(table) = bar::read_bar(&bytes)
+            && let Some(e) = table.entries.iter().find(|e| e.entry_type == 2)
+            && let Some(entry) = bytes.get(e.offset as usize..e.offset as usize + e.size as usize)
+            && entry.len() >= 8
+        {
+            let count = i32::from_le_bytes(entry[4..8].try_into().unwrap()).max(0) as usize;
+            for r in 0..count {
+                let Some(rec) = entry.get(8 + r * 8..16 + r * 8) else {
+                    break;
+                };
+                let id = u16::from_le_bytes([rec[0], rec[1]]);
+                let off = u32::from_le_bytes(rec[4..8].try_into().unwrap()) as usize;
+                let wanted = npcs.iter().any(|n| n.talk == id)
+                    || deferred.iter().any(|d| d.spawn.entity.talk == id);
+                if wanted && let Some(script) = entry.get(off..) {
+                    scripts.insert(id, dialogue::read_script(script));
+                }
+            }
+        }
+        let mut ids: Vec<u32> = scripts
+            .values()
+            .flatten()
+            .filter_map(|op| match op {
+                Op::Message(id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut lines = HashMap::new();
+        if let (false, Some((index, ordinal, hash))) = (
+            ids.is_empty(),
+            self.locate(&format!("msg/{}/{code}.bar", self.language)),
+        ) && let Ok(texts) =
+            hud::load_messages_optional(&self.source, &index, ordinal, hash, &ids)
+        {
+            for (id, text) in ids.iter().zip(texts) {
+                if let Some(t) = text {
+                    lines.insert(*id, t);
+                }
+            }
+        }
+        (npcs, deferred, scripts, lines)
+    }
+}
+
+impl LoadedArea {
+    pub fn take_collision(&mut self) -> collision::World {
+        self.collision.take().expect("area collision taken once")
+    }
+}
+
+/// A townsperson from a spawn entity: its route, behaviour zones and
+/// action records come from its spawn point (FUN_1404168c0).
+pub fn build_npc(
+    state: &Area,
+    kind: usize,
+    spawn: &Spawn,
+    entity_index: usize,
+    program: crate::npcs::Program,
+    random: &mut Lcg,
+) -> FieldNpc {
+    let object = &state.objects[spawn.point];
+    let mut npc = FieldNpc::spawn(
+        kind,
+        &spawn.entity,
+        entity_index,
+        object.point.walk_paths.first(),
+        program,
+        random,
+    );
+    let zones = object
+        .zones
+        .iter()
+        .filter(|z| {
+            let raw = &object.point.activators[z.activator].raw;
+            u16::from_le_bytes([raw[0x2c], raw[0x2d]]) == 0
+        })
+        .map(|z| crate::npcs::NpcZone {
+            id: z.option,
+            zone: z.clone(),
+        })
+        .collect();
+    let actions = object
+        .point
+        .return_params
+        .iter()
+        .map(crate::npcs::Action::read)
+        .collect();
+    npc.set_behaviour(zones, actions);
+    npc
+}
+
+struct Flags<'a>(&'a Progress);
+impl script::Game for Flags<'_> {
+    fn flag_set(&self, flag: u32) -> bool {
+        self.0.test(flag)
+    }
+}
+
+/// The map BAR's first type-6 COCT as the body collision world
+/// (FUN_1401613c0 +0x68 → FUN_1401722f0 with the area's group mask).
+/// The map's effect container: the first type-18 entry of the map BAR, with
+/// the remaster pages of its textures among the map's replacements.
+fn map_pax(
+    map: &[u8],
+    replacements: &[data::replacement_payload::ReplacementSample],
+) -> Option<data::object_effect::Pax> {
+    let table = data::bar::read_bar(map).ok()?;
+    let e = table
+        .entries
+        .iter()
+        .find(|e| e.entry_type == 18 && e.size > 0)?;
+    let bytes = map.get(e.offset as usize..e.offset as usize + e.size as usize)?;
+    let mut pax = data::object_effect::read_pax(bytes).ok()?;
+    let at = e.offset as usize;
+    pax.attach_hd(
+        at,
+        &data::object_effect::hd_pages_within(replacements, at, bytes.len()),
+    );
+    Some(pax)
+}
+
+fn map_collision(map: &[u8], mask: u64) -> Result<collision::World> {
+    let table = bar::read_bar(map)?;
+    let e = table
+        .entries
+        .iter()
+        .find(|e| e.entry_type == 6 && e.size > 0)
+        .ok_or("map has no collision")?;
+    let coct = room_collision::read(&map[e.offset as usize..e.offset as usize + e.size as usize])?;
+    Ok(collision::World::new(&coct, mask)?)
+}
+
+/// The controller's view of the map collision: one body-versus-map move
+/// per tick through the exe's solver (FUN_14016fec0 as FUN_1403b9090 calls
+/// it). The scene is Y up; the exe is Y down: (x, y, z) ↔ (x, −y, −z).
+/// The floor state of a body that has met no floor yet (engine-side
+/// normal (0, −1, 0), no material).
+pub const FLOOR_NONE: ([f32; 3], u8) = ([0., -1., 0.], 0);
+
+pub struct MapWorld {
+    world: collision::World,
+    /// Floor normal from the previous tick (obj+0x768 is −normal), (0, −1,
+    /// 0) engine-side without a floor.
+    floor_normal: std::sync::Mutex<[f32; 3]>,
+    /// Material of the floor polygon last hit (poly byte 0, 0 without one):
+    /// the footstep sound's material (obj+0x780).
+    floor_ground: std::sync::atomic::AtomicU8,
+}
+
+impl MapWorld {
+    /// The visible collision polygons as scene-coordinate triangles.
+    pub fn triangles(&self) -> Vec<[Vec3; 3]> {
+        let scene = |v: [f32; 3]| Vec3::from_array(engine(v));
+        self.world
+            .polygons()
+            .into_iter()
+            .filter(|p| p.visible)
+            .flat_map(|p| {
+                let c: Vec<Vec3> = p.corners.iter().map(|&v| scene(v)).collect();
+                (1..c.len().saturating_sub(1))
+                    .map(|i| [c[0], c[i], c[i + 1]])
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    pub fn new(world: collision::World) -> Self {
+        Self {
+            world,
+            floor_normal: std::sync::Mutex::new(FLOOR_NONE.0),
+            floor_ground: std::sync::atomic::AtomicU8::new(FLOOR_NONE.1),
+        }
+    }
+
+    /// Puts another body's previous floor normal and material in place of
+    /// the kept ones and returns those (a second Sora moves against the same
+    /// map between two swaps).
+    pub fn swap_floor_state(&self, state: ([f32; 3], u8)) -> ([f32; 3], u8) {
+        let normal = std::mem::replace(
+            &mut *self.floor_normal.lock().expect("floor normal"),
+            state.0,
+        );
+        let ground = self
+            .floor_ground
+            .swap(state.1, std::sync::atomic::Ordering::Relaxed);
+        (normal, ground)
+    }
+
+    /// An attack volume's segment against the map (FUN_140171090, class 4)
+    /// in scene coordinates: the hit point is scene, the polygon normal
+    /// stays in the engine's space (it only turns an effect).
+    pub fn attack_hit(&self, from: [f32; 3], to: [f32; 3]) -> Option<collision::AttackHit> {
+        let hit = self.world.attack_ray(engine(from), engine(to))?;
+        Some(collision::AttackHit {
+            point: engine(hit.point),
+            ..hit
+        })
+    }
+
+    /// FUN_1403b9090's solve for another object's body, in scene
+    /// coordinates; the floor normal stays in the engine's frame and is
+    /// the caller's to keep (obj+0x758). Returns the feet, CB+0x74 bit 0
+    /// and the new normal.
+    pub fn body_move(
+        &self,
+        body: &Body,
+        start: [f32; 3],
+        displacement: [f32; 3],
+        airborne: bool,
+        normal: [f32; 3],
+    ) -> ([f32; 3], bool, [f32; 3]) {
+        let mut d = engine(displacement);
+        if !airborne {
+            d = collision::project_on_floor(d, [-normal[0], -normal[1], -normal[2]]);
+        }
+        let s = collision::solve(
+            &self.world,
+            body,
+            &Query {
+                start: engine(start),
+                displacement: d,
+                airborne,
+                extra_snap: 0.,
+            },
+        );
+        let floor = collision::floor_info(&self.world, &s);
+        (engine(s.position), s.no_floor, floor.normal)
+    }
+
+    /// A script's map-line query (FUN_14040c2b0 -> FUN_140171350) in scene
+    /// coordinates: the first crossing of the segment by a polygon of
+    /// collision `class`.
+    pub fn line(&self, from: [f32; 3], to: [f32; 3], class: u32) -> Option<([f32; 3], u16)> {
+        self.world
+            .segment(engine(from), engine(to), class)
+            .map(|(p, poly)| (engine(p), poly))
+    }
+
+    /// A map polygon's unit normal in scene coordinates (FUN_140170ac0).
+    pub fn polygon_normal(&self, poly: u16) -> Option<[f32; 3]> {
+        self.world.polygon_normal(poly).map(engine)
+    }
+
+    /// A map polygon's surface nibble (FUN_140170910).
+    pub fn polygon_surface(&self, poly: u16) -> Option<u32> {
+        self.world.polygon_surface(poly)
+    }
+
+    /// The floor material under Sora as of the last move.
+    pub fn floor_ground(&self) -> u8 {
+        self.floor_ground.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+fn engine(v: [f32; 3]) -> [f32; 3] {
+    [v[0], -v[1], -v[2]]
+}
+
+impl MapWorld {
+    /// The first point where the map crosses the segment (scene
+    /// coordinates in and out), Sora's collision class.
+    pub fn line_hit(&self, from: [f32; 3], to: [f32; 3]) -> Option<[f32; 3]> {
+        self.world
+            .ray(engine(from), engine(to), SORA_BODY.class)
+            .map(|(p, _)| engine(p))
+    }
+
+    /// Switches a background group's collision meshes (FUN_140162a00 /
+    /// FUN_1401629b0 → FUN_1401715a0 / FUN_140174440).
+    pub fn set_group(&mut self, group: u8, on: bool) {
+        self.world.set_group(group, on);
+    }
+}
+
+impl player::World for MapWorld {
+    fn floor(&self, x: f32, z: f32, top: f32) -> Option<f32> {
+        // The exe's floor ray (FUN_140173b30) straight down from `top`.
+        let p0 = [x, -top, -z];
+        let p1 = [x, -top + 100_000., -z];
+        self.world.ray(p0, p1, SORA_BODY.class).map(|(p, _)| -p[1])
+    }
+
+    fn resolve_walls(&self, position: [f32; 2], _radius: f32, _low: f32, _high: f32) -> [f32; 2] {
+        // Only the single collide call moves Sora; other callers get the
+        // wanted point back.
+        position
+    }
+
+    fn collide(
+        &self,
+        start: player::Vec3,
+        displacement: player::Vec3,
+        airborne: bool,
+        _body: &player::Body,
+    ) -> player::Collided {
+        let mut d = engine(displacement);
+        if !airborne {
+            // FUN_1403b9090: the move is turned into the floor plane,
+            // keeping its length (n = obj+0x768 = −floor normal).
+            let n = *self.floor_normal.lock().expect("floor normal");
+            d = collision::project_on_floor(d, [-n[0], -n[1], -n[2]]);
+        }
+        let s = collision::solve(
+            &self.world,
+            &SORA_BODY,
+            &Query {
+                start: engine(start),
+                displacement: d,
+                airborne,
+                extra_snap: 0.,
+            },
+        );
+        let floor = collision::floor_info(&self.world, &s);
+        *self.floor_normal.lock().expect("floor normal") = floor.normal;
+        self.floor_ground
+            .store(floor.ground, std::sync::atomic::Ordering::Relaxed);
+        // Airborne: landing needs a floor while not rising (disp.y ≥ 0 in
+        // engine space) [FUN_1403b9090].
+        let on_floor = if airborne {
+            d[1] >= 0. && !s.no_floor
+        } else {
+            !s.no_floor
+        };
+        player::Collided {
+            position: engine(s.position),
+            on_floor,
+        }
+    }
+}
+
+/// The zone task's view of the player (FUN_1403a4f90): scene → engine.
+pub fn probe(position: Vec3, yaw: f32, moving: Option<[f32; 2]>, running: bool) -> PlayerProbe {
+    // Scene yaw φ faces (sin φ, cos φ); engine yaw Y = π − φ.
+    let engine_yaw = ::area::wrap(std::f32::consts::PI - yaw);
+    let (move_direction, move_speed) = match moving {
+        Some([x, z]) => ([x, 0., -z], if running { 8 } else { 2 }),
+        None => ([0.; 3], 0),
+    };
+    PlayerProbe {
+        position: [position.x, -position.y, -position.z],
+        yaw: engine_yaw,
+        move_direction,
+        move_speed,
+        can_move: true,
+    }
+}
+
+/// What the area asks the field to do this tick.
+pub fn requests(
+    area: &mut Area,
+    probe: &PlayerProbe,
+    blocked: impl Fn(u8, u8) -> bool,
+) -> Vec<Request> {
+    area.tick(probe, false, blocked)
+}
+
+/// Scene direction (x, z) from `from` toward the nearest unfired exit
+/// trigger (type-1 point, opt-0 zone) whose destination is not `avoid`.
+pub fn exit_target(area: &Area, avoid: Option<u8>, from: [f32; 2]) -> Option<[f32; 2]> {
+    let mut best: Option<(f32, [f32; 2])> = None;
+    for o in &area.objects {
+        if o.point.kind != 1 || o.flags & 1 != 0 || Some(o.point.exit_area()) == avoid {
+            continue;
+        }
+        for z in o.zones.iter().filter(|z| z.option == 0) {
+            let d = [z.center[0] - from[0], -z.center[2] - from[1]];
+            let l = d[0].hypot(d[1]);
+            if l > 0. && best.is_none_or(|(b, _)| l < b) {
+                best = Some((l, [d[0] / l, d[1] / l]));
+            }
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
+/// A room's 0x40-byte row in 03system `arif`: world count at +4, per world a
+/// u16 area count and a u16 offset at 8 + 4 * world.
+fn arif_row(arif: &[u8], world: u8, area: u8) -> Option<&[u8]> {
+    let word = |o: usize| arif.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let worlds = arif
+        .get(4..8)
+        .map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
+    let w = world as usize;
+    if world as u32 >= worlds {
+        return None;
+    }
+    match (word(8 + w * 4), word(10 + w * 4)) {
+        (Some(count), Some(off)) if (area as u16) < count => {
+            let at = off as usize + area as usize * 0x40;
+            arif.get(at..at + 0x40)
+        }
+        _ => None,
+    }
+}
+
+/// FUN_1403a5920: the row's byte +0x34 (0 outside the table).
+pub fn command_variant(arif: &[u8], world: u8, area: u8) -> u8 {
+    arif_row(arif, world, area).map_or(0, |row| row[0x34])
+}
+
+/// FUN_1403a5a80: the row's flag word (+0), bit 4.
+pub fn glow_flag(arif: &[u8], world: u8, area: u8) -> bool {
+    arif_row(arif, world, area).is_some_and(|row| row[0] >> 4 & 1 != 0)
+}
+
+/// `field2d/<language>/<world><n>command.2dd`, or `zz0command.2dd` for the
+/// default menu (FUN_140153ee0 / FUN_140154070).
+pub fn command_layout(world: &str, variant: u8, language: &str, default: bool) -> String {
+    if default {
+        format!("field2d/{language}/zz0command.2dd")
+    } else {
+        format!("field2d/{language}/{world}{variant}command.2dd")
+    }
+}
+
+#[cfg(test)]
+mod signal_tests {
+    use super::*;
+
+    fn entry(signal: i32, spawn_id: i32, jump: [i16; 6]) -> EventEntry {
+        EventEntry {
+            signal,
+            spawn_id,
+            jump: Some(jump),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_signal_finds_its_jump() {
+        let mut areas = vec![Vec::new(); 5];
+        areas[4] = vec![(0x78, 26)];
+        let events = [
+            entry(11, -1, [1, 9, 0, 6, 0, 1]),
+            entry(15, -1, [4, 4, 0, 0, 0, -1]),
+            entry(161, -1, [2, 4, 0, 3, 0x78, 1]),
+            entry(60, -1, [1, 17, 0, 50, 0, 1]),
+            entry(60, -1, [1, 17, 5, 55, 0, 1]),
+            entry(60, 0, [1, 17, 8, 50, 0, 1]),
+            entry(61, 25, [1, 17, 8, 50, 0, 1]),
+            entry(62, -1, [1, 17, 0, 50, 0, 1]),
+            entry(62, -1, [1, 17, 5, 55, 0, 1]),
+        ];
+        let field = |world, area, entrance, programs| SignalJump::Field {
+            world,
+            area,
+            entrance,
+            programs,
+        };
+        assert_eq!(
+            signal_jump(&events, &areas, 11),
+            Some(field(9, 0, 6, [-1; 3]))
+        );
+        assert_eq!(
+            signal_jump(&events, &areas, 15),
+            Some(SignalJump::WorldMap(4))
+        );
+        assert_eq!(
+            signal_jump(&events, &areas, 161),
+            Some(field(4, 26, 3, [0x78; 3]))
+        );
+        // The entry for no spawn wins over those for any.
+        assert_eq!(
+            signal_jump(&events, &areas, 60),
+            Some(field(17, 8, 50, [-1; 3]))
+        );
+        // Of those for any, the last.
+        assert_eq!(
+            signal_jump(&events, &areas, 62),
+            Some(field(17, 5, 55, [-1; 3]))
+        );
+        // An entry tied to another spawn does not answer.
+        assert_eq!(signal_jump(&events, &areas, 61), None);
+        assert_eq!(signal_jump(&events, &areas, 9), None);
+    }
+
+    #[test]
+    fn the_redirect_lands_on_program_0x7a() {
+        let mut areas = vec![Vec::new(); 3];
+        areas[2] = vec![(0x40, 3), (0x7a, 9)];
+        assert_eq!(
+            redirect_target(&areas),
+            Some(SignalJump::Field {
+                world: 2,
+                area: 9,
+                entrance: 0,
+                programs: [0x7a; 3],
+            })
+        );
+        assert_eq!(redirect_target(&areas[..2]), None);
+    }
+}
+
+#[cfg(test)]
+mod command_layout_tests {
+    use super::*;
+
+    #[test]
+    fn the_layout_follows_the_arif_digit() {
+        // Two worlds: world 0 with one area, world 1 with two (the second
+        // area's digit 5).
+        let mut arif = vec![1, 0, 0, 0, 2, 0, 0, 0];
+        arif.extend([1, 0, 16, 0, 2, 0, 80, 0]);
+        arif.resize(16 + 3 * 0x40, 0);
+        arif[80 + 0x40 + 0x34] = 5;
+        assert_eq!(command_variant(&arif, 1, 1), 5);
+        assert_eq!(command_variant(&arif, 1, 0), 0);
+        // Outside the table: 0.
+        assert_eq!(command_variant(&arif, 1, 2), 0);
+        assert_eq!(command_variant(&arif, 7, 0), 0);
+        // The flag word's bit 4 turns the room's glow on.
+        arif[80 + 0x40] = 0x10;
+        assert!(glow_flag(&arif, 1, 1));
+        assert!(!glow_flag(&arif, 1, 0));
+        assert!(!glow_flag(&arif, 7, 0));
+        assert_eq!(
+            command_layout("tt", 5, "us", false),
+            "field2d/us/tt5command.2dd"
+        );
+        assert_eq!(
+            command_layout("tt", 5, "fr", true),
+            "field2d/fr/zz0command.2dd"
+        );
+    }
+}

@@ -1,0 +1,32 @@
+name: Windows foundation
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked
+  # A draft of publishing a build (KHC-029): build.bat's KHC.exe with its SHA-256,
+  # for two players to compare. Off until the owner approves publishing.
+  release:
+    if: ${{ false }}
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - run: cmd /c "build.bat < NUL"
+      - run: (Get-FileHash target\release\KHC.exe -Algorithm SHA256).Hash | Out-File -Encoding ascii target\release\KHC.exe.sha256
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KHC
+          path: |
+            target/release/KHC.exe
+            target/release/KHC.exe.sha256

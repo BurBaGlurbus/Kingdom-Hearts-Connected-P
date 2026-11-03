@@ -1,0 +1,720 @@
+//! Explicit texture/UV inspection choices; no installed material or animation.
+use crate::{
+    hd_image::{self, HdPixelDecodeProfile},
+    model_geometry::Geometry,
+    model_texture_routing::{self, PartTextureRoute, TargetKind, TextureLinks},
+    replacement_payload::ReplacementSample,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextureMode {
+    PartColors,
+    OriginalIndexed,
+    ExactHdBase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum UvProfile {
+    #[serde(rename = "openkh_kkdf2_integer_truncated_uv_v1")]
+    Kkdf2IntegerTruncated,
+    #[serde(rename = "openkh_legacy_signed16_uv_on_kkdf2_topology_v1")]
+    LegacySigned16OnKkdf2Topology,
+}
+impl UvProfile {
+    fn components(self, [u, v]: [i32; 2]) -> [u32; 2] {
+        [u, v].map(|word| match self {
+            Self::Kkdf2IntegerTruncated => ((word / 16) as f32 / 256.0).to_bits(),
+            Self::LegacySigned16OnKkdf2Topology => (word as u16 as i16 as f32 / 4096.0).to_bits(),
+        })
+    }
+}
+#[derive(Serialize)]
+pub struct UvRoutes {
+    pub profile: UvProfile,
+    pub parts: Vec<PartTextureRoute>,
+}
+
+/// Only UV expressions vary. The qualified Kkdf2 positions/topology stay intact.
+pub fn read_uv_routes(
+    payload: &[u8],
+    geometry: &Geometry,
+    environments: usize,
+    profiles: &[UvProfile],
+) -> io::Result<Vec<UvRoutes>> {
+    if profiles.is_empty()
+        || profiles.len() > 2
+        || (profiles.len() == 2 && profiles[0] == profiles[1])
+    {
+        return Err(invalid("UV profiles must be explicit and distinct"));
+    }
+    let groups = crate::model_packets::read_packet_groups(payload)?;
+    let mut pools: Vec<_> = profiles.iter().map(|_| Vec::new()).collect();
+    let mut ordinal = 0;
+    for group in groups
+        .iter()
+        .filter(|g| g.block_offset == geometry.block_offset)
+    {
+        for (packet_ordinal, packet) in group.packets.iter().enumerate() {
+            let data = packet
+                .vpu_data
+                .as_ref()
+                .ok_or_else(|| invalid("UV inspection requires type-1 root packets"))?;
+            let part = geometry
+                .parts
+                .get(ordinal)
+                .ok_or_else(|| invalid("extra UV packet"))?;
+            if part.group_ordinal != group.group_ordinal
+                || part.packet_ordinal != packet_ordinal
+                || part.uv_bits.len() != data.strips.len()
+                || part
+                    .uv_base
+                    .checked_add(data.strips.len())
+                    .is_none_or(|n| n > 262_144)
+            {
+                return Err(invalid("UV packet/geometry identity or budget differs"));
+            }
+            for (profile, pool) in profiles.iter().zip(&mut pools) {
+                if part.uv_base != pool.len() {
+                    return Err(invalid("UV packet bases are not contiguous"));
+                }
+                pool.extend(data.strips.iter().map(|v| profile.components([v[0], v[1]])));
+            }
+            ordinal += 1;
+        }
+    }
+    if ordinal != geometry.parts.len() {
+        return Err(invalid("UV packet count differs"));
+    }
+    profiles
+        .iter()
+        .zip(pools)
+        .map(|(&profile, pool)| {
+            Ok(UvRoutes {
+                profile,
+                parts: model_texture_routing::associate_geometry_with_uv_pool(
+                    geometry,
+                    environments,
+                    &pool,
+                )?,
+            })
+        })
+        .collect()
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ImageIdentity {
+    Original { environment_ordinal: usize },
+    Replacement { replacement_ordinal: u32 },
+}
+#[derive(Serialize)]
+pub struct TextureLevel {
+    pub width: u32,
+    pub height: u32,
+    pub pixels_rgba_sha256: String,
+    #[serde(skip_serializing)]
+    pub pixels_rgba: Vec<u8>,
+}
+impl TextureLevel {
+    fn new(width: u32, height: u32, pixels_rgba: Vec<u8>) -> Self {
+        Self {
+            width,
+            height,
+            pixels_rgba_sha256: format!("{:x}", Sha256::digest(&pixels_rgba)),
+            pixels_rgba,
+        }
+    }
+}
+#[derive(Serialize)]
+pub struct TextureImage {
+    pub identity: ImageIdentity,
+    pub pixel_decode_profile: serde_json::Value,
+    pub mip_layout: Option<hd_image::Bc3MipLayout>,
+    pub levels: Vec<TextureLevel>,
+}
+#[derive(Serialize)]
+pub struct InspectionTextures {
+    pub texture_bar_ordinal: usize,
+    pub modes: Vec<TextureMode>,
+    pub images: Vec<TextureImage>,
+    pub links: TextureLinks,
+    /// Playable TEXA patches with the palette of the texture they paint.
+    #[serde(skip)]
+    pub play: Vec<TexturePlay>,
+}
+/// A TEXA patch and the CLUT (256 RGBA entries) of its target environment.
+pub struct TexturePlay {
+    pub patch: crate::model_texture_play::Patch,
+    pub clut_rgba: Vec<u8>,
+}
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+fn reserve(bytes: &mut usize, additional: usize) -> io::Result<()> {
+    *bytes = bytes
+        .checked_add(additional)
+        .filter(|&n| n <= 128 * 1024 * 1024)
+        .ok_or_else(|| invalid("inspection texture cumulative RGBA exceeds 128 MiB"))?;
+    Ok(())
+}
+/// How an admitted replacement decodes: a BC3 mip chain, or one image of
+/// the admitted size.
+enum Admitted {
+    Chain,
+    Single(u32, u32),
+}
+
+/// A replacement's header checks and its share of the RGBA budget.
+fn admit(replacement: &ReplacementSample, total_rgba: &mut usize) -> io::Result<Admitted> {
+    let bytes = &replacement.bytes;
+    let declared = replacement.metadata.declared_decompressed_length as usize;
+    let count = bytes
+        .get(28..32)
+        .map(|v| u32::from_le_bytes(v.try_into().unwrap()));
+    if bytes.starts_with(b"DDS ") && count.is_some_and(|n| n > 1) {
+        let layout = hd_image::read_bc3_mip_layout(bytes, declared)?;
+        reserve(total_rgba, layout.rgba_byte_count)?;
+        return Ok(Admitted::Chain);
+    }
+    let (width, height) = if bytes.starts_with(b"DDS ") && bytes.len() >= 128 {
+        (
+            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        )
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") && bytes.len() >= 33 {
+        (
+            u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+            u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+        )
+    } else {
+        return Err(invalid(
+            "replacement texture header is incomplete or unknown",
+        ));
+    };
+    if !(1..=hd_image::MAX_SIDE).contains(&width) || !(1..=hd_image::MAX_SIDE).contains(&height) {
+        return Err(invalid(&format!(
+            "replacement inspection dimensions outside bound ({width}x{height})"
+        )));
+    }
+    reserve(total_rgba, width as usize * height as usize * 4)?;
+    Ok(Admitted::Single(width, height))
+}
+
+/// Decodes an admitted replacement.
+fn decode_admitted_one(
+    replacement: &ReplacementSample,
+    plan: &Admitted,
+) -> io::Result<TextureImage> {
+    let bytes = &replacement.bytes;
+    let declared = replacement.metadata.declared_decompressed_length as usize;
+    let (levels, mip_layout, pixel_decode_profile) = match *plan {
+        Admitted::Chain => {
+            let chain = hd_image::decode_bc3_mip_chain(bytes, declared)?;
+            let levels = chain
+                .layout
+                .levels
+                .iter()
+                .zip(chain.levels_rgba)
+                .map(|(m, p)| TextureLevel::new(m.width, m.height, p))
+                .collect();
+            (
+                levels,
+                Some(chain.layout),
+                serde_json::to_value(chain.pixel_decode_profile)?,
+            )
+        }
+        Admitted::Single(width, height) => {
+            let decoded = hd_image::decode_hd_image_with_profile(
+                bytes,
+                declared,
+                HdPixelDecodeProfile::Bc3NormalizedNearestRgba8V1,
+            )?;
+            if decoded.width != width
+                || decoded.height != height
+                || decoded.pixels_rgba.len() != width as usize * height as usize * 4
+            {
+                return Err(invalid("decoded texture differs from allocation admission"));
+            }
+            (
+                vec![TextureLevel::new(width, height, decoded.pixels_rgba)],
+                None,
+                serde_json::to_value(decoded.pixel_decode_profile)?,
+            )
+        }
+    };
+    Ok(TextureImage {
+        identity: ImageIdentity::Replacement {
+            replacement_ordinal: replacement.metadata.ordinal,
+        },
+        pixel_decode_profile,
+        mip_layout,
+        levels,
+    })
+}
+
+/// `decode_admitted_one` of each planned replacement (the first
+/// `plans.len()`), on up to eight threads, in replacement order.
+fn decode_admitted(
+    replacements: &[impl std::borrow::Borrow<ReplacementSample> + Sync],
+    plans: &[Admitted],
+) -> Vec<io::Result<TextureImage>> {
+    let threads = plans.len().min(8);
+    if threads <= 1 {
+        return plans
+            .iter()
+            .enumerate()
+            .map(|(i, plan)| decode_admitted_one(replacements[i].borrow(), plan))
+            .collect();
+    }
+    let mut out: Vec<Option<io::Result<TextureImage>>> = (0..plans.len()).map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    (t..plans.len())
+                        .step_by(threads)
+                        .map(|i| (i, decode_admitted_one(replacements[i].borrow(), &plans[i])))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for worker in workers {
+            for (i, image) in worker.join().expect("texture decode thread") {
+                out[i] = Some(image);
+            }
+        }
+    });
+    out.into_iter()
+        .map(|o| o.expect("every plan decoded"))
+        .collect()
+}
+
+/// Read original environments and EVERY replacement, retaining complete chains.
+/// The most images a model may hold, its replacements counted: M_EX500_GM's
+/// run past 64.
+const MAX_TEXTURES: usize = 256;
+
+/// Global expansion is admitted before pixels allocate; raw headers alone do
+/// not authorize a format. Existing decoders still perform their full admission.
+pub fn read_textures(
+    payload: &[u8],
+    asset_offset: usize,
+    texture_bar_ordinal: usize,
+    replacements: &[impl std::borrow::Borrow<ReplacementSample> + Sync],
+    modes: &[TextureMode],
+    total_rgba: &mut usize,
+) -> io::Result<InspectionTextures> {
+    let layout = crate::model_texture::read_layout(payload)?;
+    if layout.images.is_empty() || layout.images.len() + replacements.len() > MAX_TEXTURES {
+        return Err(invalid(&format!(
+            "inspection texture count {} + {} outside 1..{MAX_TEXTURES}",
+            layout.images.len(),
+            replacements.len()
+        )));
+    }
+    let original_bytes: usize = layout
+        .images
+        .iter()
+        .map(|i| i.width as usize * i.height as usize * 4)
+        .sum();
+    reserve(total_rgba, original_bytes)?;
+    let metadata: Vec<_> = replacements
+        .iter()
+        .map(|r| r.borrow().metadata.clone())
+        .collect();
+    let links = model_texture_routing::read_links(payload, asset_offset, &metadata)?;
+    let decoded = crate::model_texture_pixels::decode_images(payload)?;
+    let play = crate::model_texture_play::read_patches(payload)?
+        .into_iter()
+        .filter_map(|patch| {
+            let target = decoded
+                .iter()
+                .find(|d| d.environment_ordinal == patch.environment)?;
+            (target.indexed_bits_per_pixel == 8
+                && patch.x + patch.width <= target.width
+                && patch.y + patch.height <= target.height)
+                .then(|| TexturePlay {
+                    clut_rgba: target.clut_rgba.clone(),
+                    patch,
+                })
+        })
+        .collect();
+    let mut images: Vec<_> = decoded
+        .into_iter()
+        .map(|i| TextureImage {
+            identity: ImageIdentity::Original {
+                environment_ordinal: i.environment_ordinal,
+            },
+            pixel_decode_profile: crate::model_texture_pixels::PROFILE.into(),
+            mip_layout: None,
+            levels: vec![TextureLevel::new(i.width, i.height, i.pixels_rgba)],
+        })
+        .collect();
+    // Each replacement is admitted in order against the budget from its
+    // header alone; the admitted ones then decode on several threads. The
+    // first error in replacement order wins and the budget is left as it was
+    // after that replacement's admission, as when they decoded one by one.
+    let mut plans = Vec::new();
+    let mut budget_after = Vec::new();
+    let mut admission_error = None;
+    for replacement in replacements {
+        match admit(replacement.borrow(), total_rgba) {
+            Ok(plan) => {
+                plans.push(plan);
+                budget_after.push(*total_rgba);
+            }
+            Err(e) => {
+                admission_error = Some(e);
+                break;
+            }
+        }
+    }
+    let decoded = decode_admitted(replacements, &plans);
+    for (i, image) in decoded.into_iter().enumerate() {
+        match image {
+            Ok(image) => images.push(image),
+            Err(e) => {
+                *total_rgba = budget_after[i];
+                return Err(e);
+            }
+        }
+    }
+    if let Some(e) = admission_error {
+        return Err(e);
+    }
+    Ok(InspectionTextures {
+        texture_bar_ordinal,
+        modes: modes.to_vec(),
+        images,
+        links,
+        play,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingStatus {
+    PartColors,
+    OriginalIndexed,
+    ExactHdBase,
+    UnmatchedHdBase,
+    AmbiguousHdBase,
+}
+#[derive(Serialize)]
+pub struct TextureBinding {
+    pub status: BindingStatus,
+    pub image_index: Option<usize>,
+    pub environment_ordinal: usize,
+}
+impl InspectionTextures {
+    /// The environment's HD replacement when exactly one replacement matches
+    /// it (as `ExactHdBase` binds), else its original image: the PC draws
+    /// the remastered texture where the install has one.
+    pub fn bind_hd_or_original(&self, environment: usize) -> io::Result<TextureBinding> {
+        if let Ok(binding) = self.bind(environment, TextureMode::ExactHdBase)
+            && binding.status == BindingStatus::ExactHdBase
+        {
+            return Ok(binding);
+        }
+        self.bind(environment, TextureMode::OriginalIndexed)
+    }
+
+    /// Fits region-sized remaster images to their pages. A map object's
+    /// replacement holds only its environment's region (`crops`: x, y,
+    /// width, height in the original's texels), at the original size or a
+    /// whole multiple `k`; it becomes the original page scaled by `k` with
+    /// the region replaced, so the model's UVs address it unchanged. An image
+    /// that is neither the region nor the page at a whole multiple (the
+    /// region tried first) is replaced by the original's pixels.
+    pub fn fit_hd_regions(&mut self, crops: &[(usize, [u32; 4])]) {
+        for &(environment, [x, y, cw, ch]) in crops {
+            let (Ok(hd), Ok(sd)) = (
+                self.bind(environment, TextureMode::ExactHdBase),
+                self.bind(environment, TextureMode::OriginalIndexed),
+            ) else {
+                continue;
+            };
+            let (Some(hd), Some(sd)) = (hd.image_index, sd.image_index) else {
+                continue;
+            };
+            let page = &self.images[sd].levels[0];
+            let region = &self.images[hd].levels[0];
+            let (pw, ph) = (page.width, page.height);
+            let (rw, rh) = (region.width, region.height);
+            let whole_of = |w: u32, h: u32| {
+                let k = rw / w.max(1);
+                (k >= 1 && rw == w * k && rh == h * k).then_some(k)
+            };
+            // The region first: a map's images all match their region.
+            let whole_page = [x, y, cw, ch] == [0, 0, pw, ph];
+            let fitted = match whole_of(cw, ch) {
+                Some(_) if whole_page => continue,
+                Some(k) if x + cw <= pw && y + ch <= ph => {
+                    let (w, h) = (pw * k, ph * k);
+                    let mut pixels = vec![0u8; (w * h * 4) as usize];
+                    for py in 0..h {
+                        for px in 0..w {
+                            let inside = (x * k..(x + cw) * k).contains(&px)
+                                && (y * k..(y + ch) * k).contains(&py);
+                            let from = if inside {
+                                let (u, v) = (px - x * k, py - y * k);
+                                &region.pixels_rgba[((v * rw + u) * 4) as usize..][..4]
+                            } else {
+                                let (u, v) = (px / k, py / k);
+                                &page.pixels_rgba[((v * pw + u) * 4) as usize..][..4]
+                            };
+                            let to = ((py * w + px) * 4) as usize;
+                            pixels[to..to + 4].copy_from_slice(from);
+                        }
+                    }
+                    TextureLevel::new(w, h, pixels)
+                }
+                _ if whole_of(pw, ph).is_some() => continue,
+                _ => TextureLevel::new(pw, ph, page.pixels_rgba.clone()),
+            };
+            self.images[hd].levels = vec![fitted];
+            self.images[hd].mip_layout = None;
+        }
+    }
+
+    pub fn bind(&self, environment: usize, mode: TextureMode) -> io::Result<TextureBinding> {
+        let mut binding = TextureBinding {
+            status: BindingStatus::PartColors,
+            image_index: None,
+            environment_ordinal: environment,
+        };
+        match mode {
+            TextureMode::PartColors => {}
+            TextureMode::OriginalIndexed => {
+                binding.status = BindingStatus::OriginalIndexed;
+                binding.image_index=self.images.iter().position(|i|matches!(i.identity,ImageIdentity::Original {environment_ordinal} if environment_ordinal==environment));
+                if binding.image_index.is_none() {
+                    return Err(invalid("original environment image missing"));
+                }
+            }
+            TextureMode::ExactHdBase => {
+                let target = self
+                    .links
+                    .ordered_targets
+                    .iter()
+                    .find(|t| {
+                        matches!(t.kind, TargetKind::Base) && t.environment_ordinal == environment
+                    })
+                    .ok_or_else(|| invalid("base texture target missing"))?;
+                binding.status = if target.matching_replacement_ordinals.is_empty() {
+                    BindingStatus::UnmatchedHdBase
+                } else if target.matching_replacement_ordinals.len() != 1
+                    || self
+                        .links
+                        .duplicate_candidate_offsets
+                        .contains(&target.candidate_original_asset_offset)
+                {
+                    BindingStatus::AmbiguousHdBase
+                } else {
+                    BindingStatus::ExactHdBase
+                };
+                if binding.status == BindingStatus::ExactHdBase {
+                    let ordinal = target.matching_replacement_ordinals[0];
+                    binding.image_index=self.images.iter().position(|i|matches!(i.identity,ImageIdentity::Replacement {replacement_ordinal} if replacement_ordinal==ordinal));
+                    if binding.image_index.is_none() {
+                        return Err(invalid("exact replacement image missing"));
+                    }
+                }
+            }
+        }
+        Ok(binding)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_sample(ordinal: u32, width: u32) -> ReplacementSample {
+        let mut bytes = Vec::new();
+        image::RgbaImage::from_pixel(width, 1, image::Rgba([ordinal as u8, 0, 0, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        ReplacementSample {
+            metadata: crate::replacement_payload::ReplacementMetadata {
+                ordinal,
+                name_bytes: [0; 32],
+                declared_offset: 0,
+                original_asset_offset: 0,
+                declared_decompressed_length: bytes.len() as u32,
+                compression_tag: -1,
+                package_offset: 0,
+                padded_stored_length: bytes.len() as u64,
+                compressed_bytes_consumed: None,
+                uncompressed_padding_retained: false,
+            },
+            bytes,
+        }
+    }
+
+    #[test]
+    fn replacements_decode_in_order_on_threads_and_the_first_error_wins() {
+        let samples: Vec<_> = (0..11).map(|i| png_sample(i, i + 1)).collect();
+        let mut budget = 0;
+        let plans: Vec<_> = samples
+            .iter()
+            .map(|s| admit(s, &mut budget).unwrap())
+            .collect();
+        assert_eq!(budget, (1..=11).sum::<usize>() * 4);
+        let images = decode_admitted(&samples, &plans);
+        for (i, image) in images.into_iter().enumerate() {
+            let image = image.unwrap();
+            assert_eq!(image.levels[0].width, i as u32 + 1);
+            assert_eq!(image.levels[0].pixels_rgba[0], i as u8);
+        }
+        // A replacement whose pixels disagree with its admitted size fails;
+        // an earlier failure is reported before a later one.
+        let mut bad = plans;
+        bad[3] = Admitted::Single(99, 1);
+        bad[7] = Admitted::Single(98, 1);
+        let images = decode_admitted(&samples, &bad);
+        let first = images.iter().position(|r| r.is_err());
+        assert_eq!(first, Some(3));
+    }
+    #[test]
+    fn explicit_uv_expressions_retain_truncation_sign_and_low_bits() {
+        assert_eq!(
+            UvProfile::Kkdf2IntegerTruncated.components([15, -15]),
+            [0.0f32.to_bits(); 2]
+        );
+        assert_eq!(
+            UvProfile::LegacySigned16OnKkdf2Topology.components([15, -15]),
+            [(15.0f32 / 4096.0).to_bits(), (-15.0f32 / 4096.0).to_bits()]
+        );
+        assert_eq!(
+            UvProfile::LegacySigned16OnKkdf2Topology.components([65535, 32768]),
+            [(-1.0f32 / 4096.0).to_bits(), (-8.0f32).to_bits()]
+        );
+    }
+    fn textures() -> InspectionTextures {
+        InspectionTextures {
+            texture_bar_ordinal: 0,
+            modes: vec![TextureMode::ExactHdBase],
+            images: vec![TextureImage {
+                identity: ImageIdentity::Original {
+                    environment_ordinal: 0,
+                },
+                pixel_decode_profile: "authored".into(),
+                mip_layout: None,
+                levels: vec![TextureLevel::new(1, 1, vec![1, 2, 3, 4])],
+            }],
+            links: TextureLinks {
+                profile: model_texture_routing::PROFILE,
+                texa_headers: vec![],
+                ordered_targets: vec![model_texture_routing::Target {
+                    kind: TargetKind::Base,
+                    environment_ordinal: 0,
+                    candidate_original_asset_offset: 0x20000100,
+                    matching_replacement_ordinals: vec![],
+                }],
+                unmatched_replacement_ordinals: vec![0],
+                duplicate_candidate_offsets: vec![],
+                runtime_verified: false,
+            },
+            play: Vec::new(),
+        }
+    }
+    #[test]
+    fn hd_regions_are_placed_in_their_page() {
+        let mut t = textures();
+        // A 2x2 page (texel value = index) and a 1x1 region at (1, 0), 2x.
+        t.images[0].levels = vec![TextureLevel::new(
+            2,
+            2,
+            (0..4u8).flat_map(|i| [i; 4]).collect(),
+        )];
+        t.images.push(TextureImage {
+            identity: ImageIdentity::Replacement {
+                replacement_ordinal: 7,
+            },
+            pixel_decode_profile: "authored".into(),
+            mip_layout: None,
+            levels: vec![TextureLevel::new(2, 2, vec![9; 16])],
+        });
+        t.links.ordered_targets[0].matching_replacement_ordinals = vec![7];
+        t.fit_hd_regions(&[(0, [1, 0, 1, 1])]);
+        let level = &t.images[1].levels[0];
+        assert_eq!((level.width, level.height), (4, 4));
+        let texel = |x: u32, y: u32| level.pixels_rgba[((y * 4 + x) * 4) as usize];
+        assert_eq!(
+            [texel(0, 0), texel(1, 1), texel(2, 0), texel(3, 1)],
+            [0, 0, 9, 9]
+        );
+        assert_eq!([texel(0, 2), texel(2, 3)], [2, 3]);
+        // A size that is neither region nor page: the original's pixels.
+        t.images[1].levels = vec![TextureLevel::new(3, 1, vec![9; 12])];
+        t.fit_hd_regions(&[(0, [1, 0, 1, 1])]);
+        assert_eq!(
+            t.images[1].levels[0].pixels_rgba,
+            t.images[0].levels[0].pixels_rgba
+        );
+    }
+
+    #[test]
+    fn hd_or_original_takes_the_exact_replacement_else_the_original() {
+        let mut t = textures();
+        let fallback = t.bind_hd_or_original(0).unwrap();
+        assert_eq!(fallback.status, BindingStatus::OriginalIndexed);
+        assert_eq!(fallback.image_index, Some(0));
+        t.images.push(TextureImage {
+            identity: ImageIdentity::Replacement {
+                replacement_ordinal: 7,
+            },
+            pixel_decode_profile: "authored".into(),
+            mip_layout: None,
+            levels: vec![TextureLevel::new(2, 2, vec![0; 16])],
+        });
+        t.links.ordered_targets[0].matching_replacement_ordinals = vec![7];
+        let hd = t.bind_hd_or_original(0).unwrap();
+        assert_eq!(hd.status, BindingStatus::ExactHdBase);
+        assert_eq!(hd.image_index, Some(1));
+        // Two candidates: ambiguous, so the original.
+        t.links.ordered_targets[0].matching_replacement_ordinals = vec![7, 8];
+        assert_eq!(t.bind_hd_or_original(0).unwrap().image_index, Some(0));
+    }
+
+    #[test]
+    fn unresolved_hd_never_falls_back_to_original_or_an_ordinal() {
+        let mut t = textures();
+        let missing = t.bind(0, TextureMode::ExactHdBase).unwrap();
+        assert_eq!(missing.status, BindingStatus::UnmatchedHdBase);
+        assert!(missing.image_index.is_none());
+        assert_eq!(
+            t.bind(0, TextureMode::OriginalIndexed).unwrap().image_index,
+            Some(0)
+        );
+        t.links.ordered_targets[0].matching_replacement_ordinals = vec![0, 1];
+        assert_eq!(
+            t.bind(0, TextureMode::ExactHdBase).unwrap().status,
+            BindingStatus::AmbiguousHdBase
+        );
+        t.links.ordered_targets[0].matching_replacement_ordinals = vec![0];
+        assert!(t.bind(0, TextureMode::ExactHdBase).is_err());
+        t.links.duplicate_candidate_offsets = vec![0x20000100];
+        assert_eq!(
+            t.bind(0, TextureMode::ExactHdBase).unwrap().status,
+            BindingStatus::AmbiguousHdBase
+        );
+    }
+    #[test]
+    fn allocation_admission_checks_cumulative_expansion_and_serialization_excludes_pixels() {
+        let mut bytes = 128 * 1024 * 1024 - 4;
+        reserve(&mut bytes, 4).unwrap();
+        assert!(reserve(&mut bytes, 1).is_err());
+        let json = serde_json::to_string(&textures()).unwrap();
+        assert!(!json.contains("pixels_rgba\":"));
+        assert!(json.contains("pixels_rgba_sha256"));
+    }
+}

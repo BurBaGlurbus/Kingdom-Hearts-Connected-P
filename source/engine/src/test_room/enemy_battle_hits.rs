@@ -1,0 +1,1273 @@
+//! Contact bridge for admitted gallery brains and the existing player battle
+//! context. The legacy battle step advances the shared player hit record first.
+use super::{
+    EffectRequest, Fighter, Game, PLAYER_OBJECT, PLAYER_VICTIM, abilities,
+    enemy_combat::WorldShape, enemy_gallery::GalleryActor, ensure_attack_rows, magic_room,
+    params_of, party_room,
+};
+use bevy::prelude::*;
+use data::battle_tables;
+use player::{World, combat};
+use std::collections::HashMap;
+
+#[derive(Default)]
+pub struct ContactState {
+    pub incoming_ids: HashMap<(u64, usize), (u8, i32)>,
+    /// A script attack object's id and group by its window: it keeps them
+    /// until the script frees the object (`attack_free`), across acts.
+    pub script_ids: HashMap<usize, (u8, i32)>,
+    pub previous: HashMap<(u64, usize, usize), Vec3>,
+    pub outgoing_previous: HashMap<(u64, usize), Vec3>,
+    serial: Option<u64>,
+    rewarded: bool,
+}
+impl ContactState {
+    fn defeat_reward(&mut self, hp: i32) -> bool {
+        if hp > 0 || self.rewarded {
+            false
+        } else {
+            self.rewarded = true;
+            true
+        }
+    }
+}
+
+/// Something of an enemy that can hit Sora this frame: a motion attack window
+/// or an attack object its script placed. Shapes are (kind, ordinal, centre,
+/// radius, height, the previous centre to sweep from).
+struct Candidate {
+    window: usize,
+    atkp: u16,
+    sub: u8,
+    script_slot: Option<usize>,
+    /// Applied by `attack_strike`: no hit callback runs for it.
+    direct: bool,
+    shapes: Vec<(u8, usize, Vec3, f32, f32, Option<Vec3>)>,
+}
+
+/// Script attack objects use window numbers from here up so they never collide
+/// with a motion window's.
+const SCRIPT_WINDOW: usize = 0x1000;
+
+#[derive(Clone)]
+struct Volume {
+    key: u64,
+    atkp: u16,
+    sub: u8,
+    centres: Vec<VolumeCentre>,
+    moving: Option<Vec3>,
+    magic: Option<u64>,
+    guard: bool,
+    /// A party member's volume (party_room::OutVolume): the member, its
+    /// attacker stats and origin, and whether it sweeps like a spell's.
+    member: Option<usize>,
+    stats: Option<combat::AttackerStats>,
+    origin: Option<Vec3>,
+    swept: bool,
+    pax: Option<std::sync::Arc<data::object_effect::Pax>>,
+}
+type VolumeCentre = (Vec3, f32, f32, Option<Vec3>);
+
+/// FUN_1403c94c0 between an attack volume (a sphere, else a round kind-0
+/// shape) and a target shape of kind 0, 1 or 3.
+fn overlap(centre: Vec3, radius: f32, height: f32, sphere: bool, target: &WorldShape) -> bool {
+    use player::body_push::{CYLINDER, SPHERE, Shape, overlap};
+    overlap(
+        &Shape {
+            kind: if sphere { SPHERE } else { CYLINDER },
+            centre: centre.to_array(),
+            radius,
+            height,
+        },
+        &Shape {
+            kind: target.shape,
+            centre: target.centre.to_array(),
+            radius: target.radius,
+            height: target.height,
+        },
+    )
+}
+
+fn allocate(ids: &mut combat::AttackIds, next_group: &mut i32, combo: u8) -> (u8, i32) {
+    let group = if combo == 0 {
+        combat::allocate_group(next_group)
+    } else {
+        combo as i32
+    };
+    (ids.allocate(), group)
+}
+
+fn event(log: &mut Option<std::fs::File>, value: serde_json::Value) {
+    if let Some(file) = log {
+        let _ = serde_json::to_writer(&mut *file, &value);
+        let _ = std::io::Write::write_all(file, b"\n");
+    }
+}
+
+pub fn tick(game: &mut Game, actors: &mut [GalleryActor], tick: u64) {
+    let Game {
+        sora: Fighter { player, vitals, .. },
+        clips,
+        clip_poses,
+        poses,
+        enemy,
+        action_started,
+        sora_attack,
+        magic,
+        drive,
+        cheats,
+        sound_queue,
+        effect_queue,
+        fx_calls,
+        log,
+        hero_hit_tick,
+        enemy_incoming_hits,
+        enemy_outgoing_hits,
+        world,
+        wall,
+        party,
+        enemy_guards,
+        defeated_keys,
+        party_volumes,
+        party_struck,
+        gallery_targets,
+        enemy_battle_tour,
+        battle_won,
+        ..
+    } = game;
+    let Some(rt) = enemy.as_mut() else { return };
+    let sora_at = Vec3::from_array(player.position);
+    let sora_turn = Quat::from_rotation_y(player.yaw);
+    let sora_facing = Vec3::new(player.yaw.sin(), 0., player.yaw.cos());
+    let Some(&clip_index) = poses.get(&player.pose_key()) else {
+        return;
+    };
+    let cp = &clip_poses[clip_index];
+    let frame = player.motion_frame(clips) as usize;
+    let mut volumes = Vec::new();
+    for (hand, (blade, weapon, hits)) in [
+        (&cp.blade, &cp.weapon, &cp.hits),
+        (&cp.blade2, &cp.weapon2, &cp.hits2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if blade.is_empty() || weapon.is_empty() {
+            continue;
+        }
+        let f = frame.min(blade.len() - 1);
+        let to_model = weapon[f.min(weapon.len() - 1)] * blade[f];
+        for (window, &(start, end, atkp, group)) in hits.iter().enumerate() {
+            if frame < start as usize || frame >= end as usize || !ensure_attack_rows(rt, atkp, 0) {
+                continue;
+            }
+            let centres = rt.blade[hand]
+                .get(&group)
+                .into_iter()
+                .flatten()
+                .map(|&(offset, radius)| {
+                    (
+                        sora_at + sora_turn * to_model.transform_point3(offset),
+                        radius,
+                        radius,
+                        None,
+                    )
+                })
+                .collect();
+            volumes.push(Volume {
+                key: (*action_started << 7) | (hand as u64) << 5 | window as u64,
+                atkp,
+                sub: 0,
+                centres,
+                moving: None,
+                magic: None,
+                guard: matches!(rt.rows[&atkp].kind, 2 | 3),
+                member: None,
+                stats: None,
+                origin: None,
+                swept: false,
+                pax: None,
+            });
+        }
+    }
+    if let Some(bones) = cp.body.get(frame.min(cp.body.len().saturating_sub(1))) {
+        for (window, &(start, end, atkp, group)) in cp.actor_hits.iter().enumerate() {
+            if frame < start as usize || frame >= end as usize || !ensure_attack_rows(rt, atkp, 0) {
+                continue;
+            }
+            let centres = sora_attack
+                .get(&group)
+                .into_iter()
+                .flatten()
+                .filter_map(|&(bone, offset, radius)| {
+                    Some((
+                        sora_at + sora_turn * bones.get(&bone)?.transform_point3(offset),
+                        radius,
+                        radius,
+                        None,
+                    ))
+                })
+                .collect();
+            volumes.push(Volume {
+                key: (*action_started << 7) | 2 << 5 | window as u64,
+                atkp,
+                sub: 0,
+                centres,
+                moving: None,
+                magic: None,
+                guard: matches!(rt.rows[&atkp].kind, 2 | 3),
+                member: None,
+                stats: None,
+                origin: None,
+                swept: false,
+                pax: None,
+            });
+        }
+    }
+    if let Some(m) = magic.as_ref() {
+        for v in &m.volumes {
+            if !ensure_attack_rows(rt, v.atkp, v.sub) {
+                continue;
+            }
+            volumes.push(Volume {
+                key: magic_room::KEY_BASE | v.key,
+                atkp: v.atkp,
+                sub: v.sub,
+                centres: vec![(
+                    Vec3::from_array(v.centre),
+                    v.radius,
+                    v.height,
+                    v.previous.map(Vec3::from_array),
+                )],
+                moving: v.moving.map(Vec3::from_array),
+                magic: Some(v.key),
+                guard: v.role == player::magic::Role::Guard,
+                member: None,
+                stats: None,
+                origin: None,
+                swept: false,
+                pax: None,
+            });
+        }
+    }
+    // The party's attacks (party_room::tick, one tick old).
+    // The combat tour is Sora's exercise of three actors: the party stays out.
+    // `KHC_PARTY_COMBAT` lets the party fight in it for a one-off check.
+    let party_out = *enemy_battle_tour && std::env::var_os("KHC_PARTY_COMBAT").is_none();
+    for pv in party_volumes.iter().filter(|_| !party_out) {
+        if !ensure_attack_rows(rt, pv.atkp, pv.sub) {
+            continue;
+        }
+        volumes.push(Volume {
+            key: pv.key,
+            atkp: pv.atkp,
+            sub: pv.sub,
+            centres: pv.spheres.clone(),
+            moving: pv.moving,
+            magic: None,
+            guard: false,
+            member: (pv.member != party_room::SCENE_MEMBER).then_some(pv.member),
+            stats: Some(pv.stats),
+            origin: Some(pv.origin),
+            swept: pv.spell,
+            pax: pv.pax.clone(),
+        });
+    }
+    gallery_targets.clear();
+    for volume in &volumes {
+        rt.instance_seen.insert(volume.key, tick);
+        if let std::collections::hash_map::Entry::Vacant(entry) = rt.instance_ids.entry(volume.key)
+        {
+            let combo = rt.steps[&(volume.atkp, volume.sub)][0].combo_group;
+            let id = allocate(&mut rt.ids, &mut rt.next_group, combo);
+            entry.insert(id);
+        }
+    }
+    let ab = &player.abilities;
+    vitals.attacker.mods = combat::AttackerMods {
+        player_type: true,
+        mp_charging: player.mp_charging,
+        berserk_strength: ab.berserk_strength as i32,
+        element_percent: ab.element.map(i32::from),
+        combo_step: player.combo.step as i32,
+        ground_limit: ab.ground_combo as i32,
+        air_limit: ab.air_combo as i32,
+        combo_boost: ab.combo_boost as i32,
+        air_combo_boost: ab.air_combo_boost as i32,
+        reaction_boost: ab.reaction_boost as i32,
+        combo_boost_enabled: ab.has(abilities::bit::COMBO_BOOST),
+        air_combo_boost_enabled: ab.has(abilities::bit::AIR_COMBO_BOOST),
+        reaction_boost_enabled: ab.has(abilities::bit::REACTION_BOOST),
+    };
+    let sora_body: Vec<_> = cp
+        .body
+        .get(frame.min(cp.body.len().saturating_sub(1)))
+        .into_iter()
+        .flat_map(|bones| {
+            rt.sora_body
+                .iter()
+                .filter_map(move |&(bone, offset, radius, high)| {
+                    Some((
+                        sora_at + sora_turn * bones.get(&bone)?.transform_point3(offset),
+                        radius,
+                        high,
+                    ))
+                })
+        })
+        .collect();
+    let damage_motion = (10..=39).contains(&player.motion_id(clips));
+    for actor in actors {
+        let Some(battle) = actor.battle.as_mut() else {
+            continue;
+        };
+        battle.hp_events.clear();
+        if battle.error.is_some() {
+            continue;
+        }
+        // Where the party's AI may aim: the actor's TARGET point.
+        if !(*enemy_battle_tour && std::env::var_os("KHC_PARTY_COMBAT").is_none())
+            && battle.brain.targetable()
+            && let Some(shape) = battle.pose.targets.first()
+        {
+            gallery_targets.push(party_room::GalleryTarget {
+                key: actor.id + 1,
+                position: Vec3::from_array(battle.brain.position()),
+                centre: shape.centre,
+                radius: 40.,
+            });
+        }
+        // A script scatters its own prize row when its death act asks
+        // (`obj_scatter_prize`); the hand ports drop the bound row at the
+        // kill.
+        let mut scatter: Vec<(data::battle_tables::Prize, [f32; 3])> = match &mut battle.brain {
+            super::enemy_battle::Brain::Script(a) => std::mem::take(&mut a.prizes)
+                .into_iter()
+                .filter_map(|(id, at)| Some((battle.assets.prize_row(id)?, at)))
+                .collect(),
+            _ => Vec::new(),
+        };
+        let defeated = battle.contacts.defeat_reward(battle.brain.hp());
+        if defeated
+            && !matches!(battle.brain, super::enemy_battle::Brain::Script(_))
+            && let Some(prize) = battle.assets.prize
+        {
+            scatter.push((prize, battle.brain.position()));
+        }
+        for (prize, at) in scatter {
+            let floor = world
+                .floor(at[0], at[2], at[1] + 30.)
+                .unwrap_or(at[1].max(0.));
+            for (kind, count) in player::enemy_prizes::drops(
+                &prize.counts,
+                1. + player.abilities.jackpot,
+                player.abilities.drive_converter,
+            ) {
+                for _ in 0..count {
+                    let random = [
+                        rt.rng.range(0., 1.),
+                        rt.rng.range(0., 1.),
+                        rt.rng.range(0., 1.),
+                    ];
+                    rt.orbs.push(player::enemy_prizes::Orb::spawn(
+                        kind,
+                        [at[0], floor.max(at[1]) + 20., at[2]],
+                        random,
+                    ));
+                }
+            }
+            for (item, chance) in prize.items {
+                if item != 0
+                    && rt.rng.range(0., 100.)
+                        < (chance as f32 * (1. + player.abilities.lucky_lucky))
+                {
+                    event(
+                        log,
+                        serde_json::json!({"event":"gallery_item_drop","tick":tick,"actor":actor.id,"item":item}),
+                    );
+                }
+            }
+        }
+        if defeated {
+            defeated_keys.push(battle.assets.character);
+            let low = vitals.hp * 2 <= vitals.target.max_hp;
+            let exp = player::enemy_prizes::kill_exp(
+                battle.assets.exp.0,
+                battle.assets.exp.1,
+                rt.difficulty == combat::Difficulty::Critical,
+                low.then_some(player.abilities.experience_boost as u32),
+            );
+            // FUN_1403ed110: No Experience (bit 116) takes the kill's EXP.
+            if !player.abilities.has(player::abilities::bit::NO_EXPERIENCE) {
+                super::prize_room::grant_exp(rt, vitals, exp, log, tick);
+            }
+            if let Some(d) = drive.as_mut()
+                && d.active
+            {
+                d.pending_exp += player::forms::kill_exp(d.form, battle.assets.character);
+            }
+            event(
+                log,
+                serde_json::json!({"event":"gallery_defeat","tick":tick,"actor":actor.id,"exp":exp,"character":battle.assets.character}),
+            );
+        }
+        battle.brain.record_mut().tick(1., false);
+        if battle.contacts.serial != Some(battle.serial) {
+            battle.contacts.previous.clear();
+            battle.contacts.incoming_ids.clear();
+            battle.contacts.serial = Some(battle.serial);
+        }
+        let at = Vec3::from_array(battle.brain.position());
+        let mut outgoing = None;
+        for v in &volumes {
+            let (aid, _) = rt.instance_ids[&v.key];
+            for (sphere, (centre, radius, height, prior)) in v.centres.iter().enumerate() {
+                let previous = if v.magic.is_some() || v.swept {
+                    *prior
+                } else {
+                    battle
+                        .contacts
+                        .outgoing_previous
+                        .insert((v.key, sphere), *centre)
+                };
+                if v.guard
+                    || !battle.brain.targetable()
+                    || battle.brain.record_mut().has(aid)
+                    || outgoing.is_some()
+                {
+                    continue;
+                }
+                let swept = if v.magic.is_some() || v.swept {
+                    combat::swept_volume(
+                        centre.to_array(),
+                        previous.map(|p| p.to_array()),
+                        *radius,
+                        *height,
+                    )
+                } else {
+                    combat::swept(centre.to_array(), previous.map(|p| p.to_array()), *radius)
+                };
+                for c in swept {
+                    // Only shapes whose group is on (FUN_1403ba550) are hit.
+                    let groups = battle.assets.default_groups;
+                    if let Some(shape) = battle.pose.body.iter().find(|s| {
+                        battle.brain.group_on(s.group, groups)
+                            && overlap(Vec3::from_array(c), *radius, *height, *radius == *height, s)
+                    }) {
+                        outgoing = Some((v.clone(), shape.clone(), Vec3::from_array(c)));
+                        break;
+                    }
+                }
+            }
+        }
+        let live_keys: Vec<_> = volumes.iter().map(|v| v.key).collect();
+        battle
+            .contacts
+            .outgoing_previous
+            .retain(|(key, _), _| live_keys.contains(key));
+        if let Some((v, target, centre)) = outgoing {
+            // The volume hit an actor: it no longer tests the map (wall_hit.rs).
+            wall.struck(v.key);
+            let rows = &rt.steps[&(v.atkp, v.sub)];
+            let (aid, group) = rt.instance_ids[&v.key];
+            let (counted, row) =
+                battle
+                    .brain
+                    .record_mut()
+                    .hit(aid, group, matches!(rows[0].kind, 5 | 6), |count| {
+                        let index = battle_tables::step_index(rows, count);
+                        (index, rows[index].interval)
+                    });
+            let attack = params_of(&rows[row]);
+            let direction = (v.moving.unwrap_or(if v.magic.is_some() || v.swept {
+                at - centre
+            } else {
+                at - v.origin.unwrap_or(sora_at)
+            }) * Vec3::new(1., 0., 1.))
+            .normalize_or(sora_facing);
+            if counted
+                && let Some(damage) = battle.brain.hit(
+                    direction.to_array(),
+                    target.high,
+                    &attack,
+                    v.stats.as_ref().unwrap_or(&vitals.attacker),
+                    rt.difficulty,
+                    super::enemy_battle::HitRecordInfo {
+                        param_id: v.atkp,
+                        revenge: rows[row].revenge,
+                        pool: target.parts,
+                        // Sora's own volumes (blade, body, spells) are the
+                        // leader's; a member's are a party member's.
+                        by_leader: v.member.is_none(),
+                        by_party: v.member.is_some(),
+                    },
+                )
+            {
+                battle.hp_events.push(battle.brain.hp());
+                // A member's volume that landed (Goofy's Bash keeps his shield
+                // on the enemy through its hit callback).
+                if let Some(member) = v.member {
+                    party_struck.push((member, v.key));
+                } else if v.key & party_room::SCENE_VOLUME == party_room::SCENE_VOLUME {
+                    party_struck.push((party_room::SCENE_MEMBER, v.key));
+                }
+                // Sora's own hits feed his combo, Drive and Valor EXP.
+                if damage > 0 {
+                    *enemy_outgoing_hits += 1;
+                }
+                if v.member.is_none() {
+                    player.connected = true;
+                    // FUN_1403d1730: ATKP +0x2f comes back as HP (vt+0xe8,
+                    // FUN_1403a75f0 -> FUN_1403d5e50).
+                    vitals.hp =
+                        (vitals.hp + i32::from(rows[row].hp_drain)).min(vitals.target.max_hp);
+                    player.drive.hit(
+                        rows[row].drive_drain,
+                        true,
+                        player.mp_charging,
+                        player.abilities.drive_boost,
+                    );
+                    if let Some(d) = drive.as_mut()
+                        && d.active
+                        && d.form == player::forms::VALOR
+                    {
+                        d.pending_exp += 1;
+                    }
+                }
+                if rows[row].hit_sound >= 0 {
+                    sound_queue.push((rows[row].hit_sound as u32, "hit"));
+                }
+                effect_queue.push(EffectRequest::VictimSound {
+                    object: battle.assets.object_id,
+                    reaction: rows[row].reaction,
+                    key: actor.id,
+                });
+                if rows[row].hit_effect != 0 {
+                    let delta = centre - target.centre;
+                    let y = delta.y.clamp(-target.height, target.height);
+                    let across = Vec3::new(delta.x, 0., delta.z).normalize_or_zero()
+                        * target.radius
+                        * (1. - (y / target.height).powi(2)).max(0.).sqrt();
+                    let contact = target.centre + across + Vec3::Y * y;
+                    // A spell's spark comes from the spell's own PAX.
+                    let spell_spark = v.magic.and_then(|key| {
+                        magic.as_mut().and_then(|m| {
+                            magic_room::spark(
+                                m,
+                                key,
+                                rows[row].hit_effect,
+                                contact.to_array(),
+                                direction.to_array(),
+                            )
+                        })
+                    });
+                    // A member's spell starts the element of its own PAX.
+                    let spell_spark = spell_spark.or_else(|| {
+                        v.pax.as_ref().and_then(|p| {
+                            party_room::spell_spark(
+                                p,
+                                rows[row].hit_effect,
+                                contact.to_array(),
+                                direction.to_array(),
+                                1 << 62 | tick << 8 | (aid as u64),
+                            )
+                        })
+                    });
+                    match spell_spark {
+                        Some(calls) => fx_calls.extend(calls),
+                        None => effect_queue.push(EffectRequest::Hit {
+                            effect: rows[row].hit_effect,
+                            random: rows[row].hit_effect_random,
+                            contact,
+                            direction,
+                            own: v.member.is_none() && v.magic.is_none() && (v.key >> 5) & 3 == 2,
+                            second: v.member.is_none()
+                                && v.magic.is_none()
+                                && (v.key >> 5) & 3 == 1,
+                        }),
+                    }
+                }
+                if let Some(key) = v.magic
+                    && let Some(m) = magic.as_mut()
+                {
+                    m.feedback.hit.push(key);
+                    if combat::reaction_class(attack.reaction) == 5 {
+                        let radius = rt
+                            .rng
+                            .range(rows[row].knockback[0] as f32, rows[row].knockback[1] as f32);
+                        if let Some(volume) = m.volumes.iter().find(|volume| volume.key == key)
+                            && !battle.brain.capture(
+                                key,
+                                volume.centre,
+                                radius,
+                                rows[row].spin as f32,
+                            )
+                        {
+                            let error =
+                                "this source brain's magic capture is unqualified".to_string();
+                            battle.error = Some(error.clone());
+                            actor.error = Some(error);
+                        }
+                    }
+                }
+                event(
+                    log,
+                    serde_json::json!({"event":"gallery_hit","tick":tick,"actor":actor.id,"member":v.member,"atkp":v.atkp,"sub":v.sub,"damage":damage,"hp":battle.brain.hp(),"step":row,"parts":target.parts}),
+                );
+            }
+        }
+        // Objects the actor's script made with HIT spheres (Shadow Flare's
+        // carriers, B_EX360) take the volumes too, their own records keeping
+        // one hit per volume (FUN_1403cf830 tests every object's HIT shapes).
+        if let super::enemy_battle::Brain::Script(brain) = &mut battle.brain {
+            for t in brain.made_targets() {
+                let found = volumes.iter().filter(|v| !v.guard).find_map(|v| {
+                    let &(aid, group) = rt.instance_ids.get(&v.key)?;
+                    let (c, ..) = v.centres.iter().find(|(c, r, ..)| {
+                        t.spheres.iter().any(|(s, sr)| c.distance(*s) <= r + sr)
+                    })?;
+                    Some((v, aid, group, *c))
+                });
+                let Some((v, aid, group, contact)) = found else {
+                    continue;
+                };
+                let Some(rows) = rt.steps.get(&(v.atkp, v.sub)) else {
+                    continue;
+                };
+                let Some(record) = brain.made_record_mut(t.id) else {
+                    continue;
+                };
+                if record.has(aid) {
+                    continue;
+                }
+                let (counted, row) =
+                    record.hit(aid, group, matches!(rows[0].kind, 5 | 6), |count| {
+                        let index = battle_tables::step_index(rows, count);
+                        (index, rows[index].interval)
+                    });
+                if !counted {
+                    continue;
+                }
+                let attack = params_of(&rows[row]);
+                let direction =
+                    ((t.spheres[0].0 - contact) * Vec3::new(1., 0., 1.)).normalize_or(sora_facing);
+                brain.hit_made(
+                    t.id,
+                    &enemy::damage::Hit {
+                        direction: direction.to_array(),
+                        high: false,
+                        attack: &attack,
+                        attacker: v.stats.as_ref().unwrap_or(&vitals.attacker),
+                        difficulty: rt.difficulty,
+                        param_id: u32::from(v.atkp),
+                        revenge: rows[row].revenge,
+                        pool: 0,
+                        by_leader: v.member.is_none(),
+                        by_party: v.member.is_some(),
+                    },
+                );
+                event(
+                    log,
+                    serde_json::json!({"event":"made_object_hit","tick":tick,"actor":actor.id,"object":t.id,"atkp":v.atkp}),
+                );
+            }
+        }
+        if battle.paused || !battle.brain.alive() || battle.brain.serial() != battle.serial {
+            continue;
+        }
+        let facing = Vec3::new(battle.brain.yaw().sin(), 0., battle.brain.yaw().cos());
+        let toward = ((sora_at - at) * Vec3::new(1., 0., 1.)).normalize_or_zero();
+        let mut incoming = None;
+        // The motion's attack windows, then the attack objects the script placed.
+        let keys = super::enemy_combat::hit_keys(&battle.windows);
+        let mut candidates: Vec<Candidate> = battle
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.active(battle.frame))
+            .map(|(window, w)| Candidate {
+                window: keys[window],
+                atkp: w.id,
+                sub: 0,
+                script_slot: None,
+                direct: false,
+                shapes: battle
+                    .pose
+                    .attacks
+                    .get(&w.group)
+                    .into_iter()
+                    .flatten()
+                    .map(|s| (s.shape, s.ordinal, s.centre, s.radius, s.height, None))
+                    .collect(),
+            })
+            .collect();
+        for a in battle.brain.script_attacks() {
+            let (Ok(id), Ok(sub)) = (u16::try_from(a.id), u8::try_from(a.extra.max(0))) else {
+                continue;
+            };
+            // The attack's team mask has to include Sora's team.
+            if !a.hits_sora {
+                continue;
+            }
+            candidates.push(Candidate {
+                window: SCRIPT_WINDOW + a.serial as usize,
+                atkp: id,
+                sub,
+                script_slot: Some(a.slot),
+                direct: false,
+                shapes: vec![(
+                    3,
+                    0,
+                    Vec3::from_array(a.position),
+                    a.radius,
+                    a.radius,
+                    a.previous.map(Vec3::from_array),
+                )],
+            });
+        }
+        // An attack a script applied to Sora directly (`attack_strike`) lands
+        // on her first body sphere without a sweep.
+        for (slot, id, extra) in battle.brain.take_script_strikes() {
+            let (Ok(id), Ok(sub), Some(&(body, ..))) = (
+                u16::try_from(id),
+                u8::try_from(extra.max(0)),
+                sora_body.first(),
+            ) else {
+                continue;
+            };
+            candidates.push(Candidate {
+                window: SCRIPT_WINDOW + 0x8000 + slot,
+                atkp: id,
+                sub,
+                script_slot: Some(slot),
+                direct: true,
+                shapes: vec![(3, 0, body, 0., 0., None)],
+            });
+        }
+        // The spheres of this actor's attacks, for the party members.
+        let mut member_samples: Vec<party_room::ClawSample> = Vec::new();
+        for cand in &candidates {
+            let (window, w_id) = (cand.window, cand.atkp);
+            if battle.brain.serial() != battle.serial || battle.error.is_some() {
+                break;
+            }
+            let rows = match battle.assets.attack_steps(cand.atkp, cand.sub) {
+                Ok(rows) => rows,
+                Err(_) if cand.script_slot.is_some() => continue,
+                Err(error) => {
+                    battle.error = Some(error.clone());
+                    actor.error = Some(error);
+                    break;
+                }
+            };
+            let new_ids = || allocate(&mut rt.ids, &mut rt.next_group, rows[0].combo_group);
+            let ids = if cand.script_slot.is_some() && !cand.direct {
+                *battle
+                    .contacts
+                    .script_ids
+                    .entry(window)
+                    .or_insert_with(new_ids)
+            } else {
+                *battle
+                    .contacts
+                    .incoming_ids
+                    .entry((battle.serial, window))
+                    .or_insert_with(new_ids)
+            };
+            // The sweep's start is kept for every sphere, whoever it hits.
+            let mut priors: Vec<Option<Vec3>> = Vec::with_capacity(cand.shapes.len());
+            for &(_, ordinal, centre, radius, _, forced_prior) in &cand.shapes {
+                let prior = battle
+                    .contacts
+                    .previous
+                    .insert((battle.serial, window, ordinal), centre);
+                let prior = forced_prior.or(prior);
+                priors.push(prior);
+                // A Type 3 attack is a super guard: what a Type 1 shot
+                // clashes with (CLASH pair 1-3).
+                if rows[0].kind == 3 && !party.is_empty() {
+                    enemy_guards.push((centre, radius));
+                }
+                member_samples.push(party_room::ClawSample {
+                    instance: ids.0 as u64,
+                    atkp: w_id,
+                    aid: ids.0,
+                    group: ids.1,
+                    radius,
+                    centre,
+                    points: combat::swept(centre.to_array(), prior.map(|p| p.to_array()), radius),
+                    rows: rows.clone(),
+                    only: None,
+                });
+            }
+            if vitals.record.has(ids.0) {
+                continue;
+            }
+            let mut blocked = false;
+            for (shape_index, &(shape_kind, _, centre, radius, height, _)) in
+                cand.shapes.iter().enumerate()
+            {
+                if blocked {
+                    break;
+                }
+                // Each shape by its own kind (FUN_1403c94c0: 0 round, 1 an
+                // upright cylinder, 3 a sphere) against Sora's spheres.
+                // [I] Every kind is swept between ticks as the spheres are.
+                let attack = |c: [f32; 3]| player::body_push::Shape {
+                    kind: shape_kind,
+                    centre: c,
+                    radius,
+                    height,
+                };
+                let sphere = |c: Vec3, r: f32| player::body_push::Shape {
+                    kind: player::body_push::SPHERE,
+                    centre: c.to_array(),
+                    radius: r,
+                    height: r,
+                };
+                let prior = priors[shape_index];
+                for c in combat::swept(centre.to_array(), prior.map(|p| p.to_array()), radius) {
+                    let centre = Vec3::from_array(c);
+                    let mut reflected = false;
+                    for guard in volumes.iter().filter(|v| v.guard) {
+                        let guard_row = &rt.steps[&(guard.atkp, guard.sub)][0];
+                        if !clashes(guard_row, &rows[0], sora_facing, facing, toward) {
+                            continue;
+                        }
+                        for &(guard_at, guard_radius, _, _) in &guard.centres {
+                            if !player::body_push::overlap(
+                                &attack(c),
+                                &sphere(guard_at, guard_radius),
+                            ) {
+                                continue;
+                            }
+                            vitals.record.mark(ids.0);
+                            player.connected = true;
+                            reflected = true;
+                            if let Some(slot) = cand.script_slot {
+                                battle.brain.mark_script_attack_reflected(slot);
+                            }
+                            if let Some(key) = guard.magic
+                                && let Some(m) = magic.as_mut()
+                            {
+                                *m.reflected.entry(key).or_insert(0) += 1;
+                            }
+                            let contact =
+                                guard_at + (centre - guard_at).normalize_or_zero() * guard_radius;
+                            if guard_row.refact_self == 2 || rows[0].refact_other == 2 {
+                                effect_queue.push(EffectRequest::ClashSpark {
+                                    object: battle.assets.object_id,
+                                    effect: rows[0].hit_effect,
+                                    own: rows[0].refact_self == 2,
+                                    element: 13,
+                                    at: contact,
+                                });
+                            } else if !player.action.airborne()
+                                && (guard_row.refact_self != 0 || rows[0].refact_other != 0)
+                            {
+                                effect_queue.push(EffectRequest::ClashSpark {
+                                    object: battle.assets.object_id,
+                                    effect: rows[0].hit_effect,
+                                    own: rows[0].refact_self == 2,
+                                    element: 11,
+                                    at: contact,
+                                });
+                                if player.guard_recoil([toward.x, toward.z], clips).is_some() {
+                                    *action_started = tick;
+                                }
+                                vitals.invulnerable = 80.;
+                            } else {
+                                effect_queue.push(EffectRequest::ClashSpark {
+                                    object: battle.assets.object_id,
+                                    effect: rows[0].hit_effect,
+                                    own: rows[0].refact_self == 2,
+                                    element: 13,
+                                    at: contact,
+                                });
+                                if player.guard_bounce(&battle.assets.sstm, clips).is_some() {
+                                    *action_started = tick;
+                                }
+                            }
+                            if rows[0].refact_self != 2
+                                && rows[0].reflect_motion != 0
+                                && !battle.brain.reflect(
+                                    rows[0].reflect_motion as usize,
+                                    rows[0].reflect_hit_back as f32,
+                                )
+                            {
+                                let error = "this source brain's reflect reaction is unqualified"
+                                    .to_string();
+                                battle.error = Some(error.clone());
+                                actor.error = Some(error);
+                            }
+                            event(
+                                log,
+                                serde_json::json!({"event":"gallery_guard","tick":tick,"actor":actor.id,"atkp":w_id,"guard_atkp":guard.atkp}),
+                            );
+                            break;
+                        }
+                        if reflected {
+                            break;
+                        }
+                    }
+                    if reflected {
+                        blocked = true;
+                        break;
+                    }
+                    if incoming.is_none()
+                        && *hero_hit_tick != Some(tick)
+                        && let Some(&(body, body_radius, high)) =
+                            sora_body.iter().find(|(body, body_r, _)| {
+                                player::body_push::overlap(&attack(c), &sphere(*body, *body_r))
+                            })
+                    {
+                        incoming = Some((
+                            ids,
+                            rows.clone(),
+                            high,
+                            w_id,
+                            (centre, body, body_radius),
+                            cand.script_slot.filter(|_| !cand.direct),
+                            cand.direct,
+                        ));
+                    }
+                }
+            }
+        }
+        // Donald and Goofy take the same attacks (FUN_1401b0290).
+        if !member_samples.is_empty() && !party.is_empty() {
+            let src = party_room::Source {
+                samples: &member_samples,
+                attacker: &battle.assets.attacker,
+                difficulty: rt.difficulty,
+                from: at,
+                object: battle.assets.object_id,
+                key: actor.id + 1,
+            };
+            let assets = &battle.assets;
+            for (i, m) in party.iter_mut().enumerate() {
+                let row = |id: u16| {
+                    assets
+                        .attack_steps(id, 0)
+                        .ok()
+                        .and_then(|v| v.first().copied())
+                };
+                if let Some(r) = party_room::receive(
+                    &src,
+                    &row,
+                    m,
+                    i,
+                    &*world,
+                    tick,
+                    sound_queue,
+                    effect_queue,
+                    log,
+                ) && !battle.brain.reflect(r.motion as usize, r.hit_back as f32)
+                {
+                    let error = "this source brain's reflect reaction is unqualified".to_string();
+                    battle.error = Some(error.clone());
+                    actor.error = Some(error);
+                }
+            }
+        }
+        if let Some((
+            (aid, group),
+            rows,
+            high,
+            atkp,
+            (claw_at, body_at, body_radius),
+            script_slot,
+            direct,
+        )) = incoming
+        {
+            *hero_hit_tick = Some(tick);
+            if let Some(slot) = script_slot {
+                battle.brain.mark_script_attack(slot);
+            }
+            // DAT_142a11400 bit 1 (a won mission) keeps Sora unhurt too
+            // (FUN_1403d65a0).
+            if vitals.invulnerable > 0.
+                || player.range_invulnerable(clips)
+                || cheats.invincible
+                || *battle_won
+            {
+                vitals.record.hit(aid, group, false, |_| (0, 0));
+                event(
+                    log,
+                    serde_json::json!({"event":"gallery_sora_hit_invulnerable","tick":tick,"actor":actor.id,"atkp":atkp}),
+                );
+                // The owner hears of it whether or not Sora was hurt.
+                if !direct {
+                    battle.brain.attack_reached_player(script_slot, atkp);
+                }
+                continue;
+            }
+            if vitals.hp <= 0 {
+                continue;
+            }
+            let (counted, row) =
+                vitals
+                    .record
+                    .hit(aid, group, matches!(rows[0].kind, 5 | 6), |count| {
+                        let index = battle_tables::step_index(&rows, count);
+                        (index, rows[index].interval)
+                    });
+            let attack = params_of(&rows[row]);
+            let ab = &player.abilities;
+            let state = combat::TargetState {
+                hp: vitals.hp,
+                player_type: true,
+                defender: ab.defender as i32,
+                damage_control: ab.damage_control,
+                damage_control_ratio: 50,
+                difficulty: rt.difficulty,
+                antiform: player.drive.antiform(),
+            };
+            let damage = if counted {
+                combat::damage_with(&battle.assets.attacker, &attack, &vitals.target, &state)
+            } else {
+                0
+            };
+            let veto = combat::kill_veto(ab.has(127), ab.has(128), vitals.hp, 0, damage_motion);
+            let hp_before = vitals.hp;
+            vitals.hp =
+                combat::apply_damage(vitals.hp, 0, vitals.target.max_hp, damage, veto && counted);
+            if vitals.hp < hp_before {
+                *enemy_incoming_hits += 1;
+            }
+            let direction = ((sora_at - at) * Vec3::new(1., 0., 1.)).normalize_or(Vec3::Z);
+            let hit = player::Hit {
+                reaction: attack.reaction,
+                original: attack.reaction,
+                direction: [direction.x, direction.z],
+                high,
+                knockback: attack.knockback,
+            };
+            if counted && player.react(&hit, &battle.assets.sstm, clips).is_some() {
+                *action_started = tick;
+            }
+            player
+                .drive
+                .damaged(damage, vitals.target.max_hp, player.abilities.damage_drive);
+            if damage > 0 && !player.mp.charging() && player.abilities.mp_rage > 0. {
+                let gain =
+                    (damage as f32 / vitals.target.max_hp as f32 * player.abilities.mp_rage) as i32;
+                if gain > 0 {
+                    player.mp.add(gain);
+                }
+            }
+            if counted && rows[row].hit_sound >= 0 {
+                sound_queue.push((rows[row].hit_sound as u32, "sora_hit"));
+            }
+            // Sora's own victim sound (FUN_140410d60), from his object's
+            // bank.
+            if counted {
+                effect_queue.push(EffectRequest::VictimSound {
+                    object: PLAYER_OBJECT,
+                    reaction: rows[row].reaction,
+                    key: PLAYER_VICTIM,
+                });
+            }
+            // The attacker's spark on Sora's hit shape (FUN_1403d1b40; a
+            // sphere, so height = radius), from the attacker's own effects.
+            if counted && rows[row].hit_effect != 0 {
+                let v = claw_at - body_at;
+                let y = v.y.clamp(-body_radius, body_radius);
+                let across = Vec3::new(v.x, 0., v.z).normalize_or_zero()
+                    * body_radius
+                    * (1. - (y / body_radius).powi(2)).max(0.).sqrt();
+                effect_queue.push(EffectRequest::EnemyHit {
+                    object: battle.assets.object_id,
+                    effect: rows[row].hit_effect,
+                    random: rows[row].hit_effect_random,
+                    contact: body_at + across + Vec3::Y * y,
+                    direction,
+                });
+            }
+            if vitals.hp == 0 && player.die(clips).is_some() {
+                *action_started = tick;
+            }
+            event(
+                log,
+                serde_json::json!({"event":"gallery_sora_hit","tick":tick,"actor":actor.id,"atkp":atkp,"damage":damage,"counted":counted,"hp":vitals.hp,"step":row}),
+            );
+            // FUN_1403d1730 ends with the owner's vt+0xe0 (OBJ_ATTACK).
+            if !direct {
+                battle.brain.attack_reached_player(script_slot, atkp);
+            }
+        }
+    }
+}
+
+/// Destroy expired owned attacks at the end of this field update. Native
+/// destruction clears their seen bit on every actor before freeing the ID.
+pub fn retire(game: &mut Game, actors: &mut [GalleryActor], tick: u64) {
+    let Some(rt) = game.enemy.as_mut() else {
+        return;
+    };
+    let mut expired = Vec::new();
+    rt.instance_ids.retain(|key, (id, _)| {
+        let keep = rt.instance_seen.get(key) == Some(&tick);
+        if !keep {
+            expired.push(*id)
+        }
+        keep
+    });
+    rt.instance_seen.retain(|_, seen| *seen == tick);
+    let live_instances = &rt.instance_ids;
+    rt.previous
+        .retain(|(key, _), _| live_instances.contains_key(key));
+    rt.claw_previous
+        .retain(|(key, _), _| live_instances.contains_key(key));
+    let mut live = rt
+        .instance_ids
+        .values()
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    for actor in actors.iter_mut() {
+        let Some(battle) = actor.battle.as_mut() else {
+            continue;
+        };
+        let serial = battle.brain.serial();
+        let valid = battle.brain.alive()
+            && serial == battle.serial
+            && battle.error.is_none()
+            && actor.error.is_none();
+        // A continuing window holds the id of the one it continues.
+        let keys = super::enemy_combat::hit_keys(&battle.windows);
+        battle
+            .contacts
+            .incoming_ids
+            .retain(|(started, window), (id, _)| {
+                let keep = valid
+                    && *started == serial
+                    && battle
+                        .windows
+                        .iter()
+                        .zip(&keys)
+                        .any(|(w, k)| k == window && w.active(battle.frame));
+                if !keep {
+                    expired.push(*id)
+                }
+                keep
+            });
+        // A script attack's id lives as long as its object (destruction
+        // clears its seen bit, so its Interval re-hits run on the record).
+        let objects: Vec<usize> = battle
+            .brain
+            .script_attacks()
+            .iter()
+            .map(|a| SCRIPT_WINDOW + a.serial as usize)
+            .collect();
+        let alive = battle.brain.alive() && battle.error.is_none() && actor.error.is_none();
+        battle.contacts.script_ids.retain(|window, (id, _)| {
+            let keep = alive && objects.contains(window);
+            if !keep {
+                expired.push(*id)
+            }
+            keep
+        });
+        live.extend(battle.contacts.incoming_ids.values().map(|(id, _)| *id));
+        live.extend(battle.contacts.script_ids.values().map(|(id, _)| *id));
+        let ids = &battle.contacts.incoming_ids;
+        battle
+            .contacts
+            .previous
+            .retain(|(serial, window, _), _| ids.contains_key(&(*serial, *window)));
+    }
+    // This also retires IDs owned by an actor removed through the debug menu.
+    expired.extend(rt.ids.live_ids().filter(|id| !live.contains(id)));
+    expired.sort_unstable();
+    expired.dedup();
+    for id in expired {
+        rt.enemy.record.clear_seen(id);
+        game.sora.vitals.record.clear_seen(id);
+        for r in &mut game.rivals {
+            r.fighter.vitals.record.clear_seen(id);
+        }
+        for m in &mut game.party {
+            m.record.clear_seen(id);
+        }
+        for actor in actors.iter_mut() {
+            if let Some(battle) = actor.battle.as_mut() {
+                battle.brain.record_mut().clear_seen(id);
+                if let super::enemy_battle::Brain::Script(a) = &mut battle.brain {
+                    a.clear_made_seen(id);
+                }
+            }
+        }
+        rt.ids.release(id);
+    }
+}
+
+fn clashes(
+    guard: &battle_tables::Attack,
+    attack: &battle_tables::Attack,
+    sora_facing: Vec3,
+    enemy_facing: Vec3,
+    toward: Vec3,
+) -> bool {
+    let pair = (guard.kind.min(attack.kind), guard.kind.max(attack.kind));
+    let cone = |row: &battle_tables::Attack, facing: Vec3, delta: Vec3| {
+        row.reflect_range == 0
+            || delta
+                .dot(Quat::from_rotation_y((row.reflect_angle as f32 * 2.).to_radians()) * facing)
+                < -(row.reflect_range as f32).to_radians().cos()
+    };
+    matches!(pair, (0, 0) | (0, 2) | (0, 3) | (1, 3))
+        && cone(guard, sora_facing, toward)
+        && cone(attack, enemy_facing, -toward)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn ellipse_body_uses_its_vertical_extent_and_strict_boundary() {
+        let target = WorldShape {
+            ordinal: 0,
+            group: 0,
+            centre: Vec3::ZERO,
+            radius: 20.,
+            height: 60.,
+            shape: 0,
+            parts: 0,
+            high: true,
+        };
+        assert!(overlap(Vec3::new(0., 55., 0.), 5., 5., true, &target));
+        assert!(!overlap(Vec3::new(0., 65., 0.), 5., 5., true, &target));
+        assert!(!overlap(Vec3::new(25., 0., 0.), 5., 5., true, &target));
+    }
+    #[test]
+    fn defeat_rewards_once_and_respawn_requires_new_contact_state() {
+        let mut state = ContactState::default();
+        assert!(!state.defeat_reward(1));
+        assert!(state.defeat_reward(0));
+        assert!(!state.defeat_reward(0));
+        assert!(!state.defeat_reward(-1));
+        state = ContactState::default();
+        assert!(state.defeat_reward(0));
+    }
+    #[test]
+    fn collision_clash_pairs_do_not_turn_every_contact_into_guard() {
+        let row = |kind: u8| {
+            let mut bytes = vec![0; 56];
+            bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+            bytes[10..12].copy_from_slice(&1u16.to_le_bytes());
+            bytes[12] = kind;
+            battle_tables::attack(&bytes, 1).unwrap()
+        };
+        assert!(clashes(&row(0), &row(0), Vec3::Z, Vec3::NEG_Z, Vec3::NEG_Z));
+        assert!(clashes(&row(3), &row(1), Vec3::Z, Vec3::NEG_Z, Vec3::NEG_Z));
+        assert!(!clashes(
+            &row(2),
+            &row(1),
+            Vec3::Z,
+            Vec3::NEG_Z,
+            Vec3::NEG_Z
+        ));
+        let mut cone = row(2);
+        cone.reflect_range = 90;
+        assert!(clashes(&cone, &row(0), Vec3::Z, Vec3::NEG_Z, Vec3::NEG_Z));
+        assert!(!clashes(&cone, &row(0), Vec3::Z, Vec3::NEG_Z, Vec3::Z));
+    }
+}

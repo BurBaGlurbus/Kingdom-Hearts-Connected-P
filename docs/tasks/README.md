@@ -1,0 +1,72 @@
+# Task records
+
+`KHC-` records are this project's. The `T` records came with the code from before this repository, under their old numbers and file names. They keep their original commands and paths: `source/main/src/test_room/duel_*.rs` is `source/khc/src/room/` here, `player::kh3` is `kh3_player`, `data::kh3` is `kh3_data`, `effect::cascade` is `kh3_cascade`.
+
+| Record | Task | Verdict |
+|---|---|---|
+| [KHC-062](KHC-062-open-source-review.md) | Pre-publish review: assets, licences, secrets and the network code; SECURITY.md, README top, licence texts | PASS: logo removed, relay keys and LAN discovery fixed; publishing as a fresh squashed repo waits on burba |
+| [KHC-061](KHC-061-no-debug.md) | No debug mode in Connected: no F3 menu, status line, collision view or F-key aids | PARTIAL: line gone in a capture; keys by hand NOT RUN |
+| [KHC-060](KHC-060-practice-menu.md) | Join a Room, Host a Room, LAN Host; Practice submenu for KH2 or KH3 against the training dummy | PARTIAL: KH2 practice runs; submenu by hand NOT RUN |
+| [KHC-059](KHC-059-menu-launcher.md) | The hub removed; the launcher in the 1.5+2.5 settings menu's look with Quick start, room codes first, Options and menu sounds | PARTIAL: built; sounds by ear and a duel from the new menu NOT RUN |
+| [KHC-058](KHC-058-preload.md) | Preload everything: the launcher asks once; effects, arena, KH3 and match art read before play | PARTIAL: works in the hub and a loopback duel; hitches not measured |
+| [KHC-057](KHC-057-hub-config.md) | Config in the hub's pause menu: KH2's Game page, Graphics, Sound, Other | SUPERSEDED by KHC-059 (removed); was PARTIAL: pages captured; changes by hand NOT RUN |
+| [KHC-056](KHC-056-hub-pause-menu-builds.md) | The hub's pause menu: KH2's Items and Abilities for the duel's build, Rules, KH3 ability pages | SUPERSEDED by KHC-059 (removed); was PARTIAL: top level captured; KH3's original menu not built |
+| [KHC-055](KHC-055-hub-command-deck.md) | The hub's command deck: Search match, Rules, Say, Menu; no gauge; the search's time on Triangle | SUPERSEDED by KHC-059 (removed); was PARTIAL: seen in a capture; lists and other offers NOT RUN |
+| [KHC-054](KHC-054-engine-update.md) | The engine brought up to date: running cost, fixes and single-player work merged into this copy; duels keep the weapon drawn | PARTIAL: builds, fmt and clippy PASS; tests and play NOT RUN |
+| [KHC-053](KHC-053-reply-codes.md) | Reply codes: a joiner not let in shows its own code, the host types it in and knocks back | PARTIAL: loopback and a two-window run PASS; typing and two networks NOT RUN |
+| [KHC-052](KHC-052-waypoint-plaza.md) | Waypoint Plaza, the hub's own map built in code | SUPERSEDED by KHC-059 (removed); was PARTIAL: seen in captures; doors and pads used only by the scripted run |
+| [KHC-051](KHC-051-direct-room-codes.md) | Room codes with no server: the code is the host's address, from public STUN servers and the router's UPnP or NAT-PMP mapping | PARTIAL: loopback and public STUN PASS; two networks NOT RUN; this network's router opens no port |
+| [KHC-050](KHC-050-hub-scale.md) | Hub scale: 32 headless bots on a Typical link, abuse drills | SUPERSEDED by KHC-059 (removed); was PARTIAL: server targets PASS (3.2 KB/s down, 0.3 up, tick p99 1.4 ms); client 1% low with 32 avatars FAIL; soak NOT RUN |
+| [KHC-049](KHC-049-hub-social.md) | Phrases, emotes, friends, mute, block, reports, auto-away, toasts | SUPERSEDED by KHC-059 (removed); was PARTIAL: menu pages, settings and doors built; not captured |
+| [KHC-048](KHC-048-hub-challenge-flow.md) | Challenges and duel pads on the hub server; the game's side of hub to duel and back | SUPERSEDED by KHC-059 (removed); was PARTIAL: pads to duel to hub PASS on loopback; a challenge by a person NOT RUN |
+| [KHC-047](KHC-047-player-cards.md) | Player cards: data, visibility, wire | SUPERSEDED by KHC-059 (removed); was PARTIAL: card page and small cards built; small cards captured |
+| [KHC-046](KHC-046-levels.md) | The cosmetic Level: curve, awards, caps, verified results | SUPERSEDED by KHC-059 (removed); was PARTIAL: one match rated on loopback; the result's lines not captured |
+| [KHC-045](KHC-045-hub-server.md) | The hub server (`source/hub`, `khc-hub`) and the game's hub client | SUPERSEDED by KHC-059 (removed); was PARTIAL: tests and a loopback run PASS; embedded LAN hub not built |
+| [KHC-044](KHC-044-identity-profile.md) | Player id, name rules, `Name#1234`, `profile.json`, recovery code (PROTOCOL 14) | PARTIAL: PASS; signing BLOCKED on the owner |
+| [KHC-043](KHC-043-hub-nametags.md) | Nametags, level badges, status marks, bubbles, toasts | SUPERSEDED by KHC-059 (removed); was PARTIAL: tests PASS, tags seen in captures; cost and TV reading NOT RUN |
+| [KHC-042](KHC-042-hub-avatars.md) | Avatars as light puppets, interpolation, `--hub-bots` | SUPERSEDED by KHC-059 (removed); was PARTIAL: tests PASS; 1% low with 32 FAIL |
+| [KHC-041](KHC-041-hub-mode.md) | Hub mode (`--hub`) in the Mirage Arena | SUPERSEDED by KHC-059 (removed); was PARTIAL: works; map comparison NOT RUN |
+| [KHC-030](KHC-030-presentation.md) | Victory motion slot (`--duel-victory`), K.O. slow motion, countdown warm-up, README | PARTIAL: slow motion and motion start confirmed in logs; frame target FAIL on one-PC loopback; owner picks the motion |
+| [KHC-016](KHC-016-lobby-v2.md) | Lobby v2: each player's ruleset, ruleset card, presets, rules code, prefs v2, hidden bans, shared coin (PROTOCOL 13) | PARTIAL: built, unit tests and a scripted mixed-ruleset lobby PASS; captures NOT RUN |
+| [KHC-020](KHC-020-kh1-ruleset.md) | New rulesets: KH1, then BBS, then Chain of Memories | BLOCKED: no KH1 reader (WP-07 done in KHC-016); Chain of Memories waits on the owner |
+| [KHC-015](KHC-015-cross-ruleset-parity.md) | `--bench-matrix`, `--bench-idle` and Parity (PROTOCOL 12) | PARTIAL: built and tested; matrix partial, spread FAIL with the current scripts, Parity values not set |
+| [KHC-014](KHC-014-ruleset-seam.md) | One seam (`ruleset.rs`, `SeatRule`) for what differs between rulesets; `duel_hits` branches on nothing else | PASS: no gameplay difference in one-process runs; layer path not run |
+| [KHC-013](KHC-013-mixed-ruleset-matrix.md) | Every KH2/KH3 attacker and victim pairing: routes, intent, fixes, scripted matrix | PARTIAL: three mismatches fixed, Best of 3 both ways PASS; guarded hits on KH3 logged and tallied as landed FAIL; four cells NOT RUN |
+| [KHC-018](KHC-018-internet-play.md) | Room codes through a rendezvous and relay server, direct when possible | PARTIAL: loopback PASS direct and relayed; encryption BLOCKED on the owner; two networks NOT RUN |
+| [KHC-027](KHC-027-rejoin.md) | A dropped joiner keeps the seat 30 s and comes back into the same match | PASS on loopback (back 0.19 s after the link); Wi-Fi on two PCs NOT RUN |
+| [KHC-017](KHC-017-snapshot-bandwidth.md) | Delta snapshots, flying things as lines, bytes by kind, an optional 30 Hz | PASS: 3.9 to 5.0 KB/s where it was 12; a volley's peak NOT RUN |
+| [KHC-026](KHC-026-adaptive-playout.md) | The joiner's playhead follows the host's clock over jitter, and Soras glide between snapshots | PARTIAL: skips PASS; one freeze in a start-up stall FAIL |
+| [KHC-029](KHC-029-matching-builds.md) | Readable versions, refusals that name each mismatch, a hash of the bytes read, capabilities | PARTIAL: built and PASS on loopback; Steam and Epic compared NOT RUN |
+| [KHC-034](KHC-034-prediction-camera-and-cosmetics.md) | Prediction's camera, swing sounds and overlay line | PARTIAL: logs PASS; nobody has seen or heard it |
+| [KHC-033](KHC-033-prediction.md) | The player's own Sora at once, behind `--predict` | PARTIAL: 1 tick and same results PASS; corrections FAIL their target; two PCs NOT RUN |
+| [KHC-032](KHC-032-equal-input-delay.md) | The host's buttons wait as long as the joiner's | PARTIAL: gap within 1 tick in 5 of 6 runs; two PCs NOT RUN |
+| [KHC-031](KHC-031-two-pc-baseline.md) | Network log and the two-PC checklist | PASS for the log; the checklist NOT RUN, the owner's |
+| [KHC-028](KHC-028-crash-reports.md) | Crash reports, and the other player told at once | PASS on loopback; F3 row and two PCs NOT RUN |
+| [KHC-025](KHC-025-hit-fairness.md) | The joiner's swings judged by what the joiner saw | PARTIAL: built to the targets; its benefit not shown |
+| [KHC-024](KHC-024-noise-floor-and-run-comparator.md) | Run comparator and how much runs differ on one PC | PARTIAL: comparator PASS, noise floor recorded with outliers open |
+| [KHC-023](KHC-023-replays.md) | Replays, played by the joiner's code with no socket | PASS by logs on loopback; launcher row and keys by a person NOT RUN |
+| [KHC-019](KHC-019-determinism-spike.md) | Whether the duel repeats bit for bit, and what its state costs to copy | PARTIAL: one PC recorded, two PCs and the decision NOT RUN |
+| [KHC-012](KHC-012-every-source-in-git.md) | Every source file in Git, so a fresh clone builds | PASS from what Git holds; a real clone from GitHub not run |
+| [KHC-011](KHC-011-effects-defaults-depth-glow-screen.md) | KH3's effects: the class defaults from the exe, scene depth, ground marks, bending shapes, refraction, glow, screen passes, cast voices | PASS for the spells and attacks toured; no footage comparison, Grand Magic not run |
+| [KHC-010](KHC-010-each-players-ruleset.md) | The host can let each player pick KH2 or KH3 when both have the same KH3; mixed duels on the network | PASS on loopback for its checks; guard moments, a person playing and two PCs not run |
+| [KHC-006](KHC-006-kh3-hud-movies.md) | KH3's own command deck and shotlock display, read from the player's install | PASS within its checks; real pad and two PCs not run |
+| [KHC-007](KHC-007-kh3-hud-gauges-offers-sounds.md) | KH3's HP, MP and focus gauges, commands on offer, button icons and HUD sounds | See the record |
+| [KHC-008](KHC-008-kh3-magic-effects-kh2-portrait.md) | KH3's magic effects show; KH2's Sora in the gauge's ring | See the record |
+| [KHC-009](KHC-009-kh3-effect-shaders.md) | KH3's effects drawn with KH3's own shaders; a bigger portrait | See the record |
+| [KHC-005](KHC-005-all-the-code-here.md) | All the code in this repository: no outside engine, no skateboard, no title screen | PASS within its checks |
+| [KHC-004](KHC-004-kh3-command-deck.md) | KH3 ruleset: the command deck is Attack, Magic and Items, on KH3's own command system | PASS within its checks; real pad, shortcuts and two PCs not run |
+| [T240](T240-lan-duel-sync.md) | LAN duel, phase 1: host/join over UDP, the second Sora, Sora-vs-Sora hits, discovery, overlay | PASS on one PC (two instances over loopback, the bad-link simulator, disconnects); two PCs NOT RUN; no final gate. |
+| [T241](T241-lan-duel-loadout-commands.md) | LAN duel, phase 2: the duel build, the damage rule, magic/items/Drive forms run by the host for both, effects as events | PASS on one PC (loopback, scripted joiner): build, commands, effects, sounds, HP gauge; two PCs NOT RUN; no final gate. |
+| [T242](T242-lan-duel-lobby.md) | LAN duel, phase 3: host rules and modes, bans, builds in the camp (AP 166, 24 Keyblades), ready-up, the vote and coin flip | PASS on one PC (loopback, unattended lobby); camp builds with a player and two PCs NOT RUN; no final gate. |
+| [T243](T243-lan-duel-match.md) | LAN duel, phases 5–6: countdown on the host's clock, rounds, modes, time limit, disconnect wins, results, rematch, intro and result shots | PASS on one PC (loopback matches: Best of 3, One KO, rematch, leaving); two PCs NOT RUN; no final gate. |
+| [T244](T244-lan-duel-lobby-polish.md) | LAN duel: the lobby in the game's own list, status panel, the other player's section, Keyblade picks with a preview, live AP, mid-menu leaving, Leave to the launcher's Multiplayer screen, result shots | PASS on one PC (captures); player-driven paths and two PCs NOT RUN; no final gate. |
+| [T245](T245-lan-duel-combat-fixes.md) | LAN duel: combos connect (a target's hit record, no flinch frames, one hit per swing), magic checked spell by spell | In progress: combos PASS, magic PASS on one PC (benches both ways); two PCs NOT RUN; no final gate. |
+| [T246](T246-lan-duel-pause-menu-screens.md) | LAN duel: the lobby, vote and result in the game's pause menu (one camp shared by the screens), the launcher's Multiplayer screen after its layout | In progress: loopback PASS; a player at the keys and two PCs NOT RUN; no final gate. |
+| [T248](T248-lan-duel-mirage-arena.md) | LAN duel: Birth by Sleep's Mirage Arena (vs03) read from the install as the default arena (validated BBS package, PMP/PMO/TIM2/BCD readers, ×100 scale, test-room fallback); a random game battle theme in the arena | In progress: loopback PASS; two PCs NOT RUN; no final gate. |
+| [T249](T249-lan-duel-polish.md) | LAN duel polish: the arena in 18 draws, HD textures, moving sky, lobby comfort, Forfeit, Quick rematch, no full BBS scan, the other Sora's trail and Wisdom shots, result and coin animation, smaller messages, host-list ping | PASS on one PC (two instances); warm-up, rejoin and two PCs NOT RUN; no final gate. |
+| [T258](T258-duel-command-menu-vanishes.md) | The command menu vanished during a LAN duel (a deck swap to the duel's empty second deck) | PASS for the reproduced disappearance: without a second deck the swap is refused; no final gate. |
+| [T279](T279-kh3-duel-ruleset.md) | LAN duel: a KH3 ruleset (KH3 movement and gravity, flowmotion, combo homing, focus and shotlock on KH2's motions), multiplayer only, with a Test KH3 mode | PARTIAL. Every move runs in local and loopback LAN duels; no KH3 or two-PC comparison. |
+| [T280](T280-duel-screens-in-the-games-own-windows.md) | LAN duel: the session status in the game's message balloon, the result title before the result menu, shadowed match text, no overlay over menus | PASS on loopback; two PCs not run. |
+| [T281](T281-duel-numbers-from-the-struggle-and-pick-lists.md) | LAN duel: the Struggle's countdown, timer and YOU WIN / YOU LOSE from the install (dk::TIMER translated); Decide and pick lists in the lobby menus | PASS on loopback; real input and two PCs not run. |
+| [T282](T282-kh3-combat-mod.md) | kh3 combat mod | See the record |
+| [T300](T300-kh3-ruleset-on-kh3-sora.md) | The KH3 ruleset's rules and animation on KH2's Sora: movement, combat, magic, footsteps, attach data; values read from the player's install | PARTIAL. Effect material graphs, helper joints and other Keyblades are not 1:1 |

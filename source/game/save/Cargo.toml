@@ -1,0 +1,12 @@
+[package]
+name = "save"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+# A private check against the original game's files; no tests of its own.
+[lints]
+workspace = true

@@ -1,0 +1,628 @@
+//! Bounded debug-room fight exercise. It checks actual damage dispatch and
+//! source-driven action progress; it does not establish installed equivalence.
+use super::*;
+
+pub const END: u64 = 1800;
+pub const CAPTURES: &[u64] = &[100, 160, 200, 250, 320, 600, 800, 1100, 1400, 1800];
+const DEFAULT_MODELS: &[&str] = &["M_EX020", "M_EX990", "M_EX010"];
+
+/// `KHC_TOUR_ROSTER=1`: every enemy that can fight, one after another
+/// (`KHC_TOUR_MODELS` narrows the list). Each gets [`ROSTER_SLOT`] ticks:
+/// summoned 250 in front of Sora (healed below a third), its AI on, Sora still until
+/// [`ROSTER_ATTACK`], then attacking every 20 ticks, a summary at the end.
+pub fn roster() -> bool {
+    std::env::var_os("KHC_TOUR_ROSTER").is_some()
+}
+const ROSTER_SLOT: u64 = 720;
+const ROSTER_ENABLE: u64 = 10;
+const ROSTER_ATTACK: u64 = 390;
+const ROSTER_SUMMARY: u64 = ROSTER_SLOT - 10;
+/// The tour ends itself when the roster is done.
+pub fn end() -> u64 {
+    if roster() {
+        u64::MAX / 2
+    } else if area_enemies::enabled() {
+        // `KHC_TOUR_END`: a longer area run.
+        std::env::var("KHC_TOUR_END")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(END)
+    } else {
+        END
+    }
+}
+pub fn captures() -> Vec<u64> {
+    if roster() {
+        Vec::new()
+    } else {
+        CAPTURES.to_vec()
+    }
+}
+/// Sora's Attack press (the plain tour: every 20 ticks from 700 to 1300).
+pub fn attack_pressed(tick: u64) -> bool {
+    if roster() {
+        let start = ROSTER_START.load(std::sync::atomic::Ordering::Relaxed);
+        tick >= start + ROSTER_ATTACK && tick.is_multiple_of(20)
+    } else if area_enemies::enabled() {
+        tick >= 300 && tick.is_multiple_of(20)
+    } else {
+        (700..1300).contains(&tick) && tick.is_multiple_of(20)
+    }
+}
+
+/// The tick the running roster slot started (for Sora's presses).
+static ROSTER_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX / 4);
+
+/// What one roster slot saw.
+#[derive(Default)]
+struct Slot {
+    entry: usize,
+    start: u64,
+    /// The AI was asked for; the summary was written.
+    enabling: bool,
+    summarized: bool,
+    acts: Vec<String>,
+    motions: std::collections::BTreeSet<usize>,
+    incoming: u64,
+    outgoing: u64,
+    orbs: usize,
+    spawn: Option<[f32; 3]>,
+    travelled: f32,
+    closest: f32,
+    died: Option<u64>,
+    fault: Option<String>,
+}
+
+/// The models the tour summons: `KHC_TOUR_MODELS=N_HB630` (comma
+/// separated) replaces the three ordinary enemies, for one-boss runs.
+fn models() -> Vec<String> {
+    match std::env::var("KHC_TOUR_MODELS") {
+        Ok(list) if !list.is_empty() => list.split(',').map(str::to_owned).collect(),
+        _ => DEFAULT_MODELS.iter().map(|m| (*m).to_owned()).collect(),
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct Checks {
+    scan_hidden: bool,
+    scan_locked: bool,
+    lock_released: bool,
+    /// The lock before the tour's cycle press, and whether the press moved
+    /// it to another actor while it stayed locked.
+    before_cycle: Option<enemy_target::TargetId>,
+    cycled: bool,
+    /// The roster's catalog entries still to run, and the one running.
+    queue: Option<std::collections::VecDeque<usize>>,
+    slot: Option<Slot>,
+    ran: u32,
+    clean: u32,
+    /// The area run's view of each model and each actor.
+    models: std::collections::BTreeMap<String, ModelStats>,
+    tracks: HashMap<u64, ActorTrack>,
+}
+
+/// What an area run saw of one model, over all its actors.
+#[derive(Default)]
+struct ModelStats {
+    actors: std::collections::BTreeSet<u64>,
+    acts: std::collections::BTreeSet<String>,
+    motions: std::collections::BTreeSet<usize>,
+    /// Motions the script played that have no clip.
+    no_clip: std::collections::BTreeSet<usize>,
+    faults: std::collections::BTreeSet<String>,
+    unsupported: std::collections::BTreeSet<&'static str>,
+    services: std::collections::BTreeSet<&'static str>,
+    motion_events: std::collections::BTreeSet<String>,
+    /// How far an actor rose or sank from where it began.
+    rise: f32,
+    sink: f32,
+    travelled: f32,
+    /// The longest one actor stayed on one motion in place, and where.
+    longest_still: u64,
+    still_in: String,
+    non_finite: bool,
+    died: u32,
+}
+
+/// One actor from tick to tick.
+struct ActorTrack {
+    start: [f32; 3],
+    last: [f32; 3],
+    motion: usize,
+    since: u64,
+    alive: bool,
+}
+
+/// Every tick of an area run: what each actor does.
+fn area_track(game: &mut Game, gallery: &enemy_gallery::EnemyGallery, checks: &mut Checks) {
+    let tick = game.tick;
+    if tick >= 20 {
+        // Sora takes the hits but is topped up before he falls.
+        let v = &mut game.sora.vitals;
+        if v.hp * 3 < v.target.max_hp {
+            v.hp = v.target.max_hp;
+        }
+    }
+    for a in &gallery.actors {
+        let Some(b) = a.battle.as_ref() else {
+            continue;
+        };
+        let model = gallery.catalog.entries[a.entry].model_name.clone();
+        let stats = checks.models.entry(model).or_default();
+        stats.actors.insert(a.id);
+        let at = b.brain.position();
+        let motion = b.brain.motion();
+        let alive = b.brain.alive();
+        let track = checks.tracks.entry(a.id).or_insert(ActorTrack {
+            start: at,
+            last: at,
+            motion,
+            since: tick,
+            alive,
+        });
+        if !at.iter().all(|v| v.is_finite()) {
+            stats.non_finite = true;
+            continue;
+        }
+        let d = [
+            at[0] - track.last[0],
+            at[1] - track.last[1],
+            at[2] - track.last[2],
+        ];
+        let step = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        stats.travelled += step;
+        stats.rise = stats.rise.max(at[1] - track.start[1]);
+        stats.sink = stats.sink.max(track.start[1] - at[1]);
+        if motion != track.motion || step > 0.01 || !alive {
+            track.motion = motion;
+            track.since = tick;
+        } else if tick - track.since > stats.longest_still {
+            stats.longest_still = tick - track.since;
+            stats.still_in = format!("{} motion {motion}", b.brain.description());
+        }
+        track.last = at;
+        if track.alive && !alive {
+            stats.died += 1;
+        }
+        track.alive = alive;
+        if alive {
+            stats.acts.insert(b.brain.description());
+            stats.motions.insert(motion);
+        }
+        if let Some(e) = b
+            .error
+            .clone()
+            .or_else(|| b.brain.fault())
+            .or(a.error.clone())
+        {
+            stats.faults.insert(e);
+        }
+        if let enemy_battle::Brain::Script(s) = &b.brain {
+            if alive && !s.has_clip() {
+                stats.no_clip.insert(motion);
+            }
+            stats.unsupported.extend(s.unsupported.iter().copied());
+            stats.services.extend(s.services.iter().copied());
+            stats.motion_events.extend(
+                s.motion_events
+                    .iter()
+                    .map(|&(r, k)| format!("{}{k}", if r { "range " } else { "frame " })),
+            );
+        }
+    }
+    if tick == end() {
+        let models = std::mem::take(&mut checks.models);
+        for (model, s) in models {
+            game.event(
+                serde_json::json!({"event":"area_enemy_model","tick":tick,"model":model,
+                "actors":s.actors.len(),"died":s.died,"acts":s.acts,"motions":s.motions,
+                "no_clip":s.no_clip,"faults":s.faults,"unsupported":s.unsupported,
+                "services":s.services,"motion_events":s.motion_events,"rise":s.rise,"sink":s.sink,
+                "travelled":s.travelled,"longest_still":s.longest_still,"still_in":s.still_in,
+                "non_finite":s.non_finite}),
+            );
+        }
+    }
+}
+
+/// With `KHC_AREA_ENEMIES` the tour is the area's own enemies
+/// (`area_enemies`): their state at checkpoints and a verdict at the end
+/// (every placed actor fought without a fault).
+/// [Tour setup] `KHC_TOUR_CAST=<ticks>`: Sora casts Thunder, Blizzard and Fire
+/// in turn, one every that many ticks, for the fights that turn on magic
+/// (B_CA050's medals).
+pub fn cast(tick: u64) -> Option<u8> {
+    use player::magic;
+    let every = std::env::var("KHC_TOUR_CAST")
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .filter(|&n| n != 0)?;
+    tick.is_multiple_of(every)
+        .then(|| [magic::THUNDER, magic::BLIZZARD, magic::FIRE][(tick / every % 3) as usize])
+}
+
+/// [Tour setup] `KHC_TOUR_LOW=<tick>`: Sora stops falling, and at that tick
+/// each boss drops to 1 HP, so the run reaches its death and the mission's
+/// clear (a finisher must still land the last blow).
+fn area_low(game: &mut Game, gallery: &mut enemy_gallery::EnemyGallery) {
+    let Some(at) = std::env::var("KHC_TOUR_LOW")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let v = &mut game.sora.vitals;
+    if v.hp * 3 < v.target.max_hp {
+        v.hp = v.target.max_hp;
+    }
+    let mp = &mut game.sora.player.mp;
+    if std::env::var_os("KHC_TOUR_CAST").is_some() && mp.cur * 2 < mp.max {
+        mp.cur = mp.max;
+    }
+    if game.tick >= at && game.tick.is_multiple_of(60) {
+        for b in gallery.actors.iter_mut().filter_map(|a| a.battle.as_mut()) {
+            if matches!(&b.brain, enemy_battle::Brain::Script(s) if s.boss()) && b.brain.hp() > 1 {
+                b.brain.set_hp(1);
+            }
+        }
+    }
+}
+
+fn area_checkpoints(game: &mut Game, gallery: &enemy_gallery::EnemyGallery) {
+    let tick = game.tick;
+    if !(tick.is_multiple_of(300) || tick == end()) {
+        return;
+    }
+    let actors: Vec<_> = gallery
+        .actors
+        .iter()
+        .map(|a| {
+            let battle = a.battle.as_ref().map(|b| {
+                serde_json::json!({"hp":b.brain.hp(),"alive":b.brain.alive(),
+                    "act":b.brain.description(),"motion":b.brain.motion(),
+                    "position":b.brain.position(),"error":b.error,"state":b.brain.boss_state()})
+            });
+            serde_json::json!({"actor":a.id,"model":gallery.catalog.entries[a.entry].model_name,
+                "serial":a.spawn_serial,"error":a.error,"battle":battle})
+        })
+        .collect();
+    let (incoming, outgoing) = (game.enemy_incoming_hits, game.enemy_outgoing_hits);
+    game.event(serde_json::json!({"event":"area_enemies_checkpoint","tick":tick,
+        "actors":actors,"positive_damage_to_player":incoming,"positive_damage_to_enemies":outgoing}));
+    if tick == end() {
+        let pass = !gallery.actors.is_empty()
+            && gallery
+                .actors
+                .iter()
+                .filter(|a| !a.kind.scripts.is_empty())
+                .all(|a| a.error.is_none() && a.battle.as_ref().is_some_and(|b| b.error.is_none()));
+        game.autoplay_failed |= !pass;
+        game.event(
+            serde_json::json!({"event":"area_enemies_verdict","tick":tick,"pass":pass,
+            "actors":gallery.actors.len(),"installed_comparison":"NOT RUN"}),
+        );
+    }
+}
+
+/// One tick of the roster (see [`roster`]).
+fn roster_tick(game: &mut Game, gallery: &mut enemy_gallery::EnemyGallery, checks: &mut Checks) {
+    let tick = game.tick;
+    if tick < 20 {
+        return;
+    }
+    // Sora takes the hits (so they show) but is topped up before he falls.
+    let v = &mut game.sora.vitals;
+    if v.hp * 3 < v.target.max_hp {
+        v.hp = v.target.max_hp;
+    }
+    let queue = checks.queue.get_or_insert_with(|| {
+        let only: Vec<String> = std::env::var("KHC_TOUR_MODELS")
+            .map(|l| l.split(',').map(str::to_owned).collect())
+            .unwrap_or_default();
+        gallery
+            .catalog
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                e.model_available
+                    && e.motions_available
+                    && enemy_battle::supported(e)
+                    && e.object_id != enemy_battle::SEPHIROTH
+                    && (only.is_empty() || only.contains(&e.model_name))
+            })
+            .map(|(k, _)| k)
+            .collect()
+    });
+    // The field can stand still for a tick or more (a menu, a load), so the
+    // steps go by the ticks since the slot started.
+    if checks
+        .slot
+        .as_ref()
+        .is_none_or(|s| s.summarized && tick >= s.start + ROSTER_SLOT)
+    {
+        gallery.clear();
+        let Some(entry) = queue.pop_front() else {
+            let (ran, clean) = (checks.ran, checks.clean);
+            game.event(serde_json::json!({"event":"enemy_roster_done","tick":tick,
+                "ran":ran,"clean":clean,"installed_comparison":"NOT RUN"}));
+            game.autoplay_end = tick;
+            return;
+        };
+        let at = Vec3::from_array(game.sora.player.position) + Vec3::new(0., 0., 250.);
+        gallery.queue_summon(entry, at, std::f32::consts::PI);
+        ROSTER_START.store(tick, std::sync::atomic::Ordering::Relaxed);
+        checks.slot = Some(Slot {
+            entry,
+            start: tick,
+            closest: f32::MAX,
+            orbs: game.enemy.as_ref().map_or(0, |rt| rt.orbs.len()),
+            incoming: game.enemy_incoming_hits,
+            outgoing: game.enemy_outgoing_hits,
+            ..Default::default()
+        });
+        return;
+    }
+    let Some(slot) = checks.slot.as_mut() else {
+        return;
+    };
+    let elapsed = tick - slot.start;
+    if !slot.enabling
+        && elapsed >= ROSTER_ENABLE
+        && let Some(id) = gallery.actors.first().map(|a| a.id)
+    {
+        slot.enabling = true;
+        gallery.select(id);
+        gallery.queue_battle();
+    }
+    let sora = game.sora.player.position;
+    if let Some(actor) = gallery.actors.first() {
+        if slot.fault.is_none() {
+            slot.fault = actor
+                .error
+                .clone()
+                .or_else(|| actor.battle.as_ref().and_then(|b| b.error.clone()));
+        }
+        if let Some(b) = actor.battle.as_ref() {
+            let p = b.brain.position();
+            let spawn = *slot.spawn.get_or_insert(p);
+            slot.travelled = slot
+                .travelled
+                .max(((p[0] - spawn[0]).powi(2) + (p[2] - spawn[2]).powi(2)).sqrt());
+            slot.closest = slot
+                .closest
+                .min(((p[0] - sora[0]).powi(2) + (p[2] - sora[2]).powi(2)).sqrt());
+            let act = b.brain.description();
+            if slot.acts.last() != Some(&act) && slot.acts.len() < 40 {
+                slot.acts.push(act);
+            }
+            slot.motions.insert(b.brain.motion());
+            if slot.died.is_none() && !b.brain.alive() {
+                slot.died = Some(tick - slot.start);
+            }
+        }
+    }
+    if !slot.summarized && elapsed >= ROSTER_SUMMARY {
+        slot.summarized = true;
+        let e = &gallery.catalog.entries[slot.entry];
+        let actor = gallery.actors.first();
+        let (unsupported, services, motion_events): (Vec<_>, Vec<_>, Vec<_>) = actor
+            .and_then(|a| a.battle.as_ref())
+            .and_then(|b| match &b.brain {
+                enemy_battle::Brain::Script(s) => Some((
+                    s.unsupported.iter().copied().collect(),
+                    s.services.iter().copied().collect(),
+                    s.motion_events
+                        .iter()
+                        .map(|&(r, k)| format!("{}{k}", if r { "range " } else { "frame " }))
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let enabled = actor.is_some_and(|a| a.battle.is_some());
+        if !enabled && slot.fault.is_none() {
+            // The summon or the AI's load failed; the gallery says why.
+            slot.fault = Some(gallery.status.clone());
+        }
+        let incoming = game.enemy_incoming_hits - slot.incoming;
+        let outgoing = game.enemy_outgoing_hits - slot.outgoing;
+        let orbs = game
+            .enemy
+            .as_ref()
+            .map_or(0, |rt| rt.orbs.len())
+            .saturating_sub(slot.orbs);
+        checks.ran += 1;
+        let clean = enabled && slot.fault.is_none();
+        checks.clean += u32::from(clean);
+        game.event(serde_json::json!({"event":"enemy_roster_slot","tick":tick,
+            "model":e.model_name,"object":e.object_id,"name":e.name,"type":e.object_type,
+            "enabled":enabled,"fault":slot.fault,"acts":slot.acts,
+            "motions":slot.motions,"hits_on_sora":incoming,"hits_on_enemy":outgoing,
+            "orbs":orbs,"died_after":slot.died,"travelled":slot.travelled,
+            "closest_to_sora":slot.closest,"unsupported":unsupported,"services":services,
+            "motion_events":motion_events}));
+    }
+}
+
+/// The lock is engaged at 150 and toggled off at 180; the cycle presses
+/// land between: right, then left if right found no other actor.
+const CYCLE: u64 = 165;
+const CYCLE_AGAIN: u64 = 170;
+/// Logical bits of the cycle presses (`enemy_target::cycle_direction`).
+const CYCLE_LEFT: u64 = 1 << 36;
+const CYCLE_RIGHT: u64 = 1 << 37;
+
+pub fn tick(
+    mut game: ResMut<Game>,
+    mut gallery: ResMut<enemy_gallery::EnemyGallery>,
+    mut debug: ResMut<debug_menu::DebugMenu>,
+    mut camp: Option<ResMut<CampRes>>,
+    mut checks: ResMut<Checks>,
+    mut targeting: ResMut<enemy_target::Targeting>,
+) {
+    if !game.enemy_battle_tour {
+        return;
+    }
+    if roster() {
+        roster_tick(&mut game, &mut gallery, &mut checks);
+        return;
+    }
+    if area_enemies::enabled() {
+        area_low(&mut game, &mut gallery);
+        area_track(&mut game, &gallery, &mut checks);
+        area_checkpoints(&mut game, &gallery);
+        return;
+    }
+    let tick = game.tick;
+    if tick == 5 {
+        for (model, offset) in models().iter().zip([
+            Vec3::new(-80., 0., 150.),
+            Vec3::new(80., 0., 180.),
+            Vec3::new(150., 0., 250.),
+        ]) {
+            if let Some(entry) = gallery.catalog.entries.iter().position(|e| {
+                e.model_name == model.as_str() && e.model_available && e.motions_available
+            }) {
+                let at = Vec3::from_array(game.sora.player.position) + offset;
+                gallery.queue_summon(entry, at, std::f32::consts::PI);
+                game.event(serde_json::json!({"event":"enemy_combat_tour_summon",
+                    "tick":tick,"model":model,"debug_position":at.to_array(),
+                    "authored_debug_placement":true}));
+            } else {
+                game.autoplay_failed = true;
+                game.event(
+                    serde_json::json!({"event":"enemy_combat_tour_missing_model",
+                    "tick":tick,"model":model}),
+                );
+            }
+        }
+    }
+    if tick == 60 {
+        if let Err(error) = enemy_target::set_scan(&mut game, camp.as_deref_mut(), true) {
+            game.autoplay_failed = true;
+            game.event(
+                serde_json::json!({"event":"combat_tour_scan_failed","tick":tick,"reason":error}),
+            );
+        }
+        let ids: Vec<_> = gallery.actors.iter().map(|actor| actor.id).collect();
+        for id in ids {
+            gallery.select(id);
+            gallery.queue_battle();
+            game.event(serde_json::json!({"event":"enemy_combat_tour_enable",
+                "tick":tick,"actor":id}));
+        }
+    }
+    if [150, 180].contains(&tick) {
+        game.lock_queued = true;
+    }
+    // Switching the lock between the actors (cycle right).
+    if tick == CYCLE {
+        checks.before_cycle = targeting.holder.target;
+        targeting.queue_cycle(CYCLE_RIGHT);
+        game.cycle_queued = true;
+    }
+    if tick == CYCLE_AGAIN && !checks.cycled {
+        targeting.queue_cycle(CYCLE_LEFT);
+        game.cycle_queued = true;
+    }
+    if [CYCLE + 1, CYCLE_AGAIN + 1].contains(&tick) {
+        let locked = game.target_locked;
+        game.event(
+            serde_json::json!({"event":"enemy_combat_tour_cycle","tick":tick,
+            "target":format!("{:?}",targeting.holder.target),"locked":locked,
+            "limitation":targeting.limitation}),
+        );
+    }
+    if (CYCLE + 1..180).contains(&tick)
+        && game.target_locked
+        && targeting.holder.target.is_some()
+        && checks.before_cycle.is_some()
+        && targeting.holder.target != checks.before_cycle
+    {
+        checks.cycled = true;
+    }
+    if [80, 140].contains(&tick) {
+        let enabled = tick == 140;
+        if let Err(error) = enemy_target::set_scan(&mut game, camp.as_deref_mut(), enabled) {
+            game.autoplay_failed = true;
+            game.event(
+                serde_json::json!({"event":"combat_tour_scan_failed","tick":tick,"reason":error}),
+            );
+        }
+        game.event(
+            serde_json::json!({"event":"combat_tour_scan_toggle","tick":tick,"enabled":enabled}),
+        );
+    }
+    if [100, 160, 300, 600, 800, 1100, 1400, END].contains(&tick) {
+        let actors = gallery
+            .actors
+            .iter()
+            .map(|actor| {
+                let battle = actor.battle.as_ref().map(|battle| {
+                    serde_json::json!({"hp":battle.brain.hp(),
+                        "alive":battle.brain.alive(),"targetable":battle.brain.targetable(),
+                        "action":battle.brain.description(),"motion":battle.brain.motion(),
+                        "serial":battle.brain.serial(),"error":battle.error})
+                });
+                serde_json::json!({"actor":actor.id,
+                    "model":gallery.catalog.entries[actor.entry].model_name,
+                    "battle_enabled":actor.battle.is_some(),
+                    "motion_choice":actor.motion_choice,"frame":actor.frame,
+                    "position":actor.position.to_array(),"error":actor.error,"battle":battle})
+            })
+            .collect::<Vec<_>>();
+        let incoming = game.enemy_incoming_hits;
+        let outgoing = game.enemy_outgoing_hits;
+        let scan_enabled = game.sora.player.abilities.has(enemy_target::SCAN_BIT);
+        let locked = game.target_locked;
+        let target = game.selected_target;
+        match tick {
+            100 => checks.scan_hidden = !scan_enabled,
+            160 => checks.scan_locked = scan_enabled && locked && target.is_some(),
+            600 => checks.lock_released = !locked,
+            _ => {}
+        }
+        game.event(serde_json::json!({"event":"enemy_combat_tour_checkpoint",
+            "tick":tick,"actors":actors,"positive_damage_to_player":incoming,
+            "positive_damage_to_enemies":outgoing,
+            "scan_enabled":scan_enabled,
+            "locked":locked,"target":target,
+            "installed_comparison":"NOT RUN"}));
+    }
+    if tick == END {
+        // This finite exercise requires both directions of actual damage.
+        // It does not pass an AI, timing, enemy inventory or gameplay gate.
+        let models = models();
+        let pass = gallery.actors.len() == models.len()
+            && models.iter().all(|model| {
+                gallery.actors.iter().any(|actor| {
+                    gallery.catalog.entries[actor.entry].model_name == model.as_str()
+                        && actor.battle.is_some()
+                        && actor.error.is_none()
+                        && actor
+                            .battle
+                            .as_ref()
+                            .is_some_and(|battle| battle.error.is_none())
+                })
+            })
+            && game.enemy_incoming_hits > 0
+            && game.enemy_outgoing_hits > 0
+            && checks.scan_hidden
+            && checks.scan_locked
+            && checks.lock_released
+            && checks.cycled;
+        game.autoplay_failed |= !pass;
+        let incoming = game.enemy_incoming_hits;
+        let outgoing = game.enemy_outgoing_hits;
+        game.event(serde_json::json!({"event":"enemy_combat_tour_verdict",
+            "tick":tick,"pass":pass,"positive_damage_to_player":incoming,
+            "positive_damage_to_enemies":outgoing,
+            "scan_hidden":checks.scan_hidden,"scan_locked":checks.scan_locked,
+            "lock_released":checks.lock_released,"lock_cycled":checks.cycled,
+            "boundary":"three ordinary actors in an authored debug arena",
+            "installed_comparison":"NOT RUN"}));
+        debug.show_enemy_actors();
+    }
+}

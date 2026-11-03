@@ -1,0 +1,14 @@
+[package]
+name = "kh3_player"
+description = "KH3's moves as a layer over the KH2 controller, for the duel's KH3 ruleset; runs kh3_sora."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+player.workspace = true
+kh3_sora = { path = "../kh3_sora" }
+
+[lints]
+workspace = true

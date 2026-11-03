@@ -1,0 +1,17 @@
+[package]
+name = "relay"
+description = "Kingdom Hearts: Connected: the rendezvous and relay server for internet duels."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+net = { path = "../net" }
+
+[[bin]]
+name = "khc_relay"
+path = "src/main.rs"
+
+[lints]
+workspace = true

@@ -1,0 +1,177 @@
+Kingdom Hearts: Connected
+
+The bounded bdscript header/opcode reader in
+data/src/bdscript.rs follows OpenKH BdxHeader.cs and
+BdxInstructionDescs.cs at commit
+7a3b945c538d32c6a285128c98aefba093f52ceb (Apache-2.0), checked against the
+selected native interpreter with Ghidra. Bounds and direct control-flow
+inspection are owned; this is not an implementation of engine traps,
+indirect act callbacks, or installed PC-specific interpreter adjustments.
+
+The package original transform in data/src/original.rs
+is adapted from OpenKH EgsEncryption.cs at commit
+7a3b945c538d32c6a285128c98aefba093f52ceb under Apache-2.0.
+The implementation is modified for bounded byte-wise handling in Rust.
+Replacement payload alignment follows EgsHdAsset.cs at the same pin;
+complete explicit selection adds count and cumulative allocation bounds.
+HD image decoding uses image 0.25.10/png 0.18.1 and crc32fast 1.5.2
+(MIT OR Apache-2.0), with owned range/profile checks. The codec feature graph
+uses zlib-rs 0.6.8 (Zlib); its unchanged notice is retained in
+docs/release/zlib-rs-LICENSE.txt. Full dependency attribution remains a release
+qualification requirement.
+The bounded legacy DDS BGRA8 route preserves byte channels using the standard
+32-bit A8R8G8B8 masks. Its explicit straight-RGBA profile is checked against
+unchanged private DirectXTex LoadScanline BGRA/StoreScanline RGBA case statements
+at 1acf4ebe6330e06b7eb52e8db63d4f824ad77427 (Microsoft, MIT). Public source and
+compiled research adapters remain outside Git/distribution; row/pitch/surface
+exclusions are owned inspection bounds, not a complete DDS format claim.
+The explicit legacy BC3 mip-chain inspection profile follows the standard DDS
+surface layout, checked against unchanged DirectXTex ComputePitch BC3 normal
+branch and MulOverflow at the same Microsoft pin. Pixel arithmetic retains the
+explicit normalized CPU profile checked against unchanged DecodeBC1/D3DXDecodeBC3
+and DirectXMath UNORM8 storage. Private public extracts/binaries remain external;
+complete-chain bounds and output envelopes are owned. This does not qualify
+installed filtering, material routing, hardware rounding or runtime behavior.
+The room COCT v1 raw-record reader adapts Coct.cs at the OpenKH pin above,
+preserving float bits, flags and table/graph indices with added bounds checks.
+Its explicit polygon display topology follows MapStudio CollisionModel.cs;
+it does not define installed movement or collision response rules.
+Room visual geometry follows Model.cs, ModelBackground.cs and MdlxParser.cs
+at the same OpenKH pin. Stateful VIF upload observation preserves memory/mask
+between microprogram stops; it does not execute VU code. Map packet views
+follow VpuPacket.cs. Added limits/rejection paths and Bevy scene code are owned.
+Candidate name generation in tools/Compare-CandidateNames.ps1 follows
+the KH2-only EgsTools rules at the same pin; upstream catalogs are
+referenced privately and are not included in this repository.
+The bounded interpolated-motion reader adapts Motion.cs at the same OpenKH pin.
+Complete keys and alignment tails remain separate; constraint/helper/root and
+expression structures are retained without claiming installed evaluation.
+Explicit basic FK sampling follows legacy Motion.Read, Kh2MotionEngine.cs and
+MathEx.cs, with added bounds and rejection of undefined zero-duration results.
+It ignores scale, inverse curves, IK, constraints, expressions, root motion and
+triggers just as the selected basic consumer does; no installed clock is chosen.
+Retained skin bindings reuse the explicit public pose arithmetic above. Native
+preview frame stepping, mesh updates and finite capture tours are owned code.
+The explicit sequential trigger-record profile additionally follows the
+MotionTrigger.cs constructor at the same pin. Declared offsets, signed frames,
+unknown IDs and trailing bytes are retained; widths beyond four parameters
+reject rather than truncating. No installed event behavior is inferred.
+The bounded message-record reader follows Msg.Read/GetMsgData at the
+same OpenKH pin, retaining encoded spans without a glyph dictionary.
+System-message token boundaries additionally follow the pinned system decoder
+length table. The differing command 0x17 length is retained as an explicit
+research conflict; installed runtime semantics and Unicode are not asserted.
+The optional explicit International-system text profile follows the public
+InternationalSystemDecode table and BaseMessageDecoder text grouping at that
+same pin. Complex symbols and original encoded spans remain distinct;
+unsupported slots and unmapped tables are preserved without fabricated text.
+Optional public-profile re-encoding follows InternationalSystemEncode at the
+same pin, paired with original borrowed spans and explicit unmapped exclusions.
+Public unsupported-value aliases are observations, never source replacements.
+The localized font plane/palette decoder follows RawBitmap.cs,
+Contextes/FontContext.cs and Ps2.Utility.cs/Ps2.Repl.cs at that pin.
+The Rust decoder adds strict plane/palette length checks and private previews.
+Explicit font-cell candidate coordinates follow Constants.cs and the
+Kh2MessageRenderer DrawChar methods at the same pin, with added bounds and
+non-aliased bank checks. Original spacing bytes remain uninterpreted;
+public profile coordinates do not assert installed runtime glyph behavior.
+Bounded model structure and DMA selection follow Mdlx.Model.cs at that pin.
+The explicit CPU VIF profile in vif.rs adapts VifUnpacker.cs for bounded Rust
+first-run, zero-TOPS execution while retaining the public reader's behavior.
+Raw type-1 VU data ranges follow VpuPacket.cs; bounds, integer bit preservation
+and format exclusions are added. The explicit type-1 topology profile follows
+VpuPacketExtensions.cs and
+Kkdf2MdlxParser.cs at that pin, adding association/index/ring/allocation checks.
+Topology retains the public integer UV truncation and first-submodel scope;
+Installed bind matrices, skinning, materials and rendering stay open.
+Explicit inspection bind routes in model_pose.rs follow the public
+BuildTPoseMatrices/GetBoneMatrices and Kkdf2 single/multi expressions.
+Numerical FMA ordering and quaternion/matrix formulas adapt .NET runtime
+60629d14374c56f1cb51819049ad1fa529307f8d under MIT; its notice is retained in
+docs/release/dotnet-runtime-LICENSE.txt. Rust sin/cos and finite comparisons
+do not select installed rendering, authoritative simulation or a tolerance.
+Neither CPU profile nor model observations
+assert PS2 hardware, installed transforms, shadow geometry or gameplay fidelity.
+The explicit bounded model-texture layout/CLUT profile follows ModelTexture.cs,
+Tm2.cs and Ps2.Utility.cs at the same OpenKH pin. Raw transfer/environment words,
+indexed image spans, palette addressing and alpha conversion remain separate
+from pixel swizzle, HD replacement routing, footer animation and installed GS
+behavior. Footer spans follow TextureFooterData.cs/UvScroll.cs without decoding
+animation or assigning unknown payload meaning.
+The explicit indexed model-texture pixel profile additionally adapts
+Texture.GetData and Ps2.Reform32.cs/Ps2.Reform8.cs/Ps2.Reform4.cs at that pin.
+Encode32 is a pure memory byte rearrangement in this route. Complete page,
+dimension, length and allocation bounds are added; indexed4 output preserves
+the public high-nibble-first packing. CPU equality does not qualify installed
+GS sampling, HD material routing, texture animation or shader behavior.
+The explicit model texture-link inspection profile adapts EgsTools.RAW offset
+formulas and TextureAnimation header/stride at the same OpenKH pin. It reads
+only bounded recognized footer chunks instead of the public whole-payload
+signature scan. Exact replacement offsets remain raw; unmatched or ambiguous
+links are retained. Geometry associations retain Kkdf2 global UV references
+and the GraphicsDeviceExtensions 16-bit texture-index mask. This does not
+select the installed UV route or interpret high replacement-offset flags.
+Textured model inspection adapts both pinned public UV expressions while
+retaining Kkdf2 topology. The signed16 expression does not incorporate the
+whole legacy parser. Original/exact HD bindings and diagnostic presentation
+choices remain explicit; source mip levels and TEXA metadata are retained
+without inferred sampling, material or animation behavior.
+The explicit bounded TEXA record profile additionally adapts the read-only
+TextureFooterData constructor, TextureFrame getters and BitsUtil.SignExtend
+at the same OpenKH pin. Fixed-size frame graphs and signed slots remain
+observations; body/allocation/visit bounds are added. Unknown controls and raw
+duration/sprite/header values remain retained. No playback, timer, slot or
+installed animation behavior is inferred.
+
+The bounded PRTY inspection reader additionally follows PrtyFile.Read at the
+same pin, retaining distinct raw offset records after the first table slot.
+Header-overlapping records are exposed explicitly. Character mappings, units
+and runtime movement rules are not inferred from these records.
+
+OpenKH - Open Kingdom Hearts Research and Development
+Copyright 2019-2022 OpenKH Team and Contributors
+
+This product includes software developed at
+The OpenKH GitHub Repository (https://git.openkh.dev/).
+
+The native mesh inspection dependency bevy_mikktspace 1.0.0 includes
+Copyright (C) 2011 by Morten S. Mikkelsen and
+Copyright (c) 2017 The mikktspace Library Developers.
+See docs/release/bevy-mikktspace-Zlib.txt and bevy-mikktspace-MIT.txt.
+The PTYA attack-set and 00objentry readers follow the public layouts in
+OpenKH docs/kh2/file/type/00battle.md and Objentry.cs at the pin above; the
+motion slot chooser follows MotionSet.GetMotionSetIndex. Range-trigger IDs
+honoured by the test room follow docs/kh2/file/anb/anb.md and COCT surface
+flag bits follow docs/kh2/file/type/coct.md. These are public labels; the
+test-room controller does not claim installed movement or combat rules.
+The motion evaluator in data/src/motion_eval.rs reads the IK
+helper, joint order, constraint, limiter, expression and root-position tables
+using the layouts in OpenKH docs/kh2/file/anb/motion.md (pin above) and
+kenjiuno's msetDoc README (gitlab.com/kenjiuno/msetDoc). No code was copied;
+the solver rules are this project's own and are recorded as inferences in T057.
+
+The combat rules in the player controller were checked against the KH2 Combat
+Kit by steferro78 (https://github.com/steferro78-HIV/kh2-combat-kit, MIT).
+No code or data from that project is copied. It was reviewed and used only as a
+cross-check for the variable-height jump and the Square-button moves (T105).
+The ported behaviour follows the decompiled exe routines cited in the code.
+
+The KH3 ruleset and KH3 mode in this repository (kh3_player, kh3_data,
+kh3_cascade, kh3_shader, kh3_sora, kh3_ui) follow kingdom-hearts-x-elden-ring by StrawHatPro
+(https://github.com/StrawHatPro/kingdom-hearts-x-elden-ring, MIT, Copyright (c)
+2026 StrawHatPro; the licence text is in CREDITS.md). Its movement, flowmotion,
+combo homing, focus and shotlock behaviour and tuning numbers were reimplemented
+in source/kh3_player. Its readers' formats were reimplemented in source/kh3_data
+(pak, package, tagged properties, skeletal and static meshes, animations,
+textures, SEAD, HCA). Its crates/kh-vfx was ported, with its notice kept, as
+source/kh3_cascade; its crates/kh-core as source/kh3_sora; and the auto SE
+detector of its crates/kh-audio as the room's KH3 sound module. An earlier local
+port of the KineDriver and Bonamik solvers of its crates/kh-anim was removed
+before this repository began.
+
+No KH3 game files ship here: the KH3 mode reads the player's own install at run
+time. Numbers and names derived from KH3 are in this repository's source:
+tuning values, ability names and costs, reflected enum names (kh3_sora/src/gen),
+executable addresses in comments, and the recipe tables in
+source/kh3_data/src/recipes. The recipe tables hold only pointers into the
+player's install (asset paths and executable offsets), no copied values.

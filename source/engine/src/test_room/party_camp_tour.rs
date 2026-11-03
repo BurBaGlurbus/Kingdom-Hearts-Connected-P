@@ -1,0 +1,191 @@
+//! The unattended `--party-camp-tour <dir>` (in the ability tour's setup,
+//! a room with Donald and Goofy): the camp's Customize, Abilities, Status
+//! and Equip pages of Donald, each switched to Goofy with R2, the top
+//! level's and Party's member models, Donald's second staff, and a check
+//! that Donald's record took every change.
+//!
+//! Customize: △ on Battle Style (Technic → Target), △ on Thunder (Free →
+//! Well-Balanced), its popup's Rare, △ twice on Potion (OFF+Often →
+//! ON+Often → OFF+Last hope!), its popup's ON+Last hope!. Abilities: △
+//! twice on Thunder (Rare → unequipped → Free), its popup's Well-Balanced.
+use super::ability_inventory::Tour;
+
+/// Logical camp bits (pad mode 7).
+const OPEN: u64 = 0x2;
+const UP: u64 = 0x10;
+const DOWN: u64 = 0x20;
+const DECIDE: u64 = 0x4;
+const CANCEL: u64 = 0x8;
+const TRIANGLE: u64 = 0x1000;
+const R2: u64 = 0x1_0000;
+
+/// Waits before each press: a cursor move, and a new screen's opening.
+const MOVE: u64 = 15;
+const SCREEN: u64 = 90;
+
+/// (wait, press, capture 35 ticks after it).
+const STEPS: &[(u64, u64, bool)] = &[
+    // Top: the party frame with the three models; Items → Abilities →
+    // Customize.
+    (20, DOWN, true),
+    (MOVE, DOWN, false),
+    (20, DECIDE, false),
+    // 0x19: Donald's preview.
+    (SCREEN, DOWN, true),
+    (20, DECIDE, false),
+    // 0x1b: the style, Thunder, its popup's Rare.
+    (SCREEN, TRIANGLE, true),
+    (20, DOWN, false),
+    (MOVE, TRIANGLE, true),
+    (30, DECIDE, true),
+    (SCREEN, DOWN, false),
+    (MOVE, DECIDE, true),
+    // Potion: two △, then its popup's ON+Last hope!.
+    (SCREEN, DOWN, false),
+    (MOVE, DOWN, false),
+    (MOVE, TRIANGLE, true),
+    (40, TRIANGLE, true),
+    (40, DECIDE, true),
+    (SCREEN, DOWN, false),
+    (MOVE, DECIDE, true),
+    // R2: Goofy's list; back to the top.
+    (SCREEN, R2, true),
+    (SCREEN, CANCEL, false),
+    (SCREEN, CANCEL, false),
+    // Abilities: Donald's preview (up from Sora: Goofy, then Donald; the
+    // forms sit between Sora and Donald), list, △ twice, popup's Well-Balanced.
+    (SCREEN, UP, false),
+    (20, DECIDE, false),
+    (SCREEN, UP, false),
+    (20, UP, true),
+    (45, DECIDE, false),
+    (SCREEN, TRIANGLE, true),
+    (40, TRIANGLE, true),
+    (40, DECIDE, true),
+    (SCREEN, DOWN, false),
+    (MOVE, DECIDE, true),
+    (SCREEN, R2, true),
+    (SCREEN, CANCEL, false),
+    // Up from Goofy past Donald: the last form's row, its view-only list.
+    (SCREEN, UP, false),
+    (20, UP, true),
+    (45, DECIDE, false),
+    (SCREEN, DOWN, true),
+    (SCREEN, R2, true),
+    (SCREEN, CANCEL, false),
+    (SCREEN, CANCEL, false),
+    // Status: from Sora up to Goofy, then Donald, his stats.
+    (SCREEN, DOWN, false),
+    (MOVE, DOWN, false),
+    (MOVE, DOWN, false),
+    (20, DECIDE, true),
+    (SCREEN, UP, true),
+    (20, UP, true),
+    (20, DECIDE, true),
+    (SCREEN, CANCEL, false),
+    // Up from Donald: the last form's row.
+    (SCREEN, UP, true),
+    (SCREEN, CANCEL, false),
+    // Items: Donald → Equip, his weapon list, the second staff, R2 to Goofy.
+    (SCREEN, UP, false),
+    (MOVE, UP, false),
+    (MOVE, UP, false),
+    (MOVE, UP, false),
+    (20, DECIDE, false),
+    (SCREEN, DOWN, true),
+    (20, DECIDE, true),
+    (SCREEN, DECIDE, true),
+    (MOVE, DOWN, false),
+    (MOVE, DECIDE, true),
+    (SCREEN, R2, true),
+    (SCREEN, CANCEL, false),
+    (SCREEN, CANCEL, false),
+    // Party: the members' cards with their models.
+    (SCREEN, DOWN, false),
+    (MOVE, DOWN, false),
+    (MOVE, DOWN, false),
+    (20, DECIDE, false),
+    (SCREEN, UP, true),
+    // Donald and Goofy change places: the room follows when the camp closes.
+    (20, DECIDE, false),
+    (20, DECIDE, true),
+    (SCREEN, CANCEL, false),
+    (SCREEN, CANCEL, false),
+];
+
+/// The camp opens at this tick.
+const START: u64 = 40;
+
+pub fn tour(slots: Vec<u16>) -> Tour {
+    // `KHC_TOUR_KEYS=<tick>:<bits>,...` and `KHC_TOUR_CAPTURES=<tick>,...`:
+    // another route, for a place whose party isn't Donald and Goofy.
+    if let Ok(keys) = std::env::var("KHC_TOUR_KEYS") {
+        let inputs: Vec<(u64, u64)> = keys
+            .split(',')
+            .filter_map(|k| {
+                let (at, bits) = k.split_once(':')?;
+                Some((at.parse().ok()?, bits.parse().ok()?))
+            })
+            .collect();
+        let captures: Vec<u64> = std::env::var("KHC_TOUR_CAPTURES")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|t| t.parse().ok())
+            .collect();
+        let close = inputs.last().map_or(START, |i| i.0);
+        let end = captures.last().map_or(close, |&c| c.max(close)) + 60;
+        return Tour {
+            inputs,
+            captures,
+            close,
+            end,
+            expected_slots: slots,
+            attacks: Vec::new(),
+        };
+    }
+    let mut inputs = vec![(START, OPEN)];
+    let mut captures = Vec::new();
+    let mut tick = START;
+    for &(wait, press, capture) in STEPS {
+        tick += wait;
+        inputs.push((tick, press));
+        if capture {
+            captures.push(tick + 35);
+        }
+    }
+    // The room after the camp: Donald holds the staff he was given.
+    captures.push(tick + 90);
+    // Reopened, the camp shows the row's order; the field kept its own.
+    inputs.push((tick + 120, OPEN));
+    captures.push(tick + 180);
+    inputs.push((tick + 200, CANCEL));
+    Tour {
+        inputs,
+        captures,
+        close: tick,
+        end: tick + 260,
+        expected_slots: slots,
+        attacks: Vec::new(),
+    }
+}
+
+/// Donald's record after the tour: Target Attack, Thunder equipped at
+/// Well-Balanced, Potion on Auto-Reload at Last hope!, a staff in hand.
+pub fn donald_passes(s: &player::party_members::Save) -> bool {
+    let thunder = s.abilities.contains(&0x80a7);
+    let potion = s.originals[..usize::from(s.item_slots)].contains(&1);
+    s.style == 1 && thunder && s.frequency[9] == 1 && potion && s.frequency[0] == 2 && s.weapon != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inputs_and_captures_end_before_the_close() {
+        let t = tour(Vec::new());
+        assert!(t.inputs.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(t.captures.iter().all(|&c| c < t.end));
+        assert!(t.inputs.iter().any(|i| i.0 == t.close));
+    }
+}

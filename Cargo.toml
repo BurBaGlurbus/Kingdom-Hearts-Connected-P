@@ -1,0 +1,78 @@
+[workspace]
+members = [
+    "source/engine",
+    "source/visual",
+    "source/visual/effect",
+    "source/audio",
+    "source/data",
+    "source/validation",
+    "source/game/player",
+    "source/game/enemy",
+    "source/game/area",
+    "source/game/collision",
+    "source/game/event",
+    "source/game/save",
+    "source/game/gummi",
+    "source/game/world_map",
+    "source/net",
+    "source/relay",
+    "source/kh3_sora",
+    "source/kh3_data",
+    "source/kh3_cascade",
+    "source/kh3_ui",
+    "source/kh3_shader",
+    "source/bbs_data",
+    "source/kh3_player",
+    "source/khc",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+glam = "=0.32.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+engine = { path = "source/engine" }
+visual = { path = "source/visual" }
+audio = { path = "source/audio" }
+effect = { path = "source/visual/effect" }
+area = { path = "source/game/area" }
+data = { path = "source/data" }
+player = { path = "source/game/player" }
+validation = { path = "source/validation" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
+opt-level = 3
+
+[profile.dev.package.validation]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[profile.dev.package.data]
+opt-level = 3
+
+[profile.dev.package.kh3_data]
+opt-level = 3
+
+[profile.dev.package.lewton]
+opt-level = 3

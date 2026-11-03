@@ -1,0 +1,39 @@
+[package]
+name = "khc"
+description = "Kingdom Hearts: Connected: the room with multiplayer and the KH3 ruleset, and its launcher."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+engine.workspace = true
+visual.workspace = true
+audio.workspace = true
+effect.workspace = true
+area.workspace = true
+data.workspace = true
+player.workspace = true
+validation.workspace = true
+net = { path = "../net" }
+kh3_sora = { path = "../kh3_sora" }
+kh3_player = { path = "../kh3_player" }
+kh3_data = { path = "../kh3_data" }
+kh3_cascade = { path = "../kh3_cascade" }
+kh3_ui = { path = "../kh3_ui" }
+kh3_shader = { path = "../kh3_shader" }
+bbs_data = { path = "../bbs_data" }
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+getrandom = "=0.4.3"
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+bevy = { version = "=0.19.1", default-features = false, features = ["std", "async_executor", "multi_threaded", "bevy_log", "bevy_asset", "bevy_window", "bevy_winit", "bevy_render", "bevy_camera", "bevy_image", "bevy_sprite", "bevy_sprite_render", "bevy_core_pipeline", "bevy_post_process", "bevy_pbr", "bmp", "bevy_gilrs"] }
+
+[[bin]]
+name = "KHC"
+path = "src/main.rs"
+
+[lints]
+workspace = true

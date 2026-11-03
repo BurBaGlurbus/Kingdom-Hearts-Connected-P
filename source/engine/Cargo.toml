@@ -1,0 +1,49 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+visual = { path = "../visual" }
+audio = { path = "../audio" }
+effect = { path = "../visual/effect" }
+glam = "=0.32.1"
+area = { path = "../game/area" }
+collision = { path = "../game/collision" }
+event = { path = "../game/event" }
+data = { path = "../data" }
+player = { path = "../game/player" }
+enemy = { path = "../game/enemy" }
+save = { path = "../game/save" }
+world_map = { path = "../game/world_map" }
+gummi = { path = "../game/gummi" }
+validation = { path = "../validation" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+# Heap allocation counts for the opt-in per-frame record (perf-diag only).
+stats_alloc = { version = "=0.1.10", optional = true }
+fontdue = { version = "=0.9.4", default-features = false, features = ["std"] }
+image = { version = "=0.25.10", default-features = false, features = ["png"] }
+bevy = { version = "=0.19.1", default-features = false, features = ["std", "async_executor", "multi_threaded", "bevy_log", "bevy_asset", "bevy_window", "bevy_winit", "bevy_render", "bevy_camera", "bevy_image", "bevy_sprite", "bevy_sprite_render", "bevy_core_pipeline", "bevy_pbr", "bmp", "bevy_gilrs"] }
+
+# Windows on Linux: without these two winit has no display backend to open one.
+[target.'cfg(target_os = "linux")'.dependencies]
+bevy = { version = "=0.19.1", default-features = false, features = ["x11", "wayland"] }
+
+[lib]
+name = "engine"
+path = "src/lib.rs"
+
+[features]
+# Opt-in performance diagnostics (see `src/perf.rs`): Bevy's frame time,
+# entity and memory diagnostics, and `--perf <dir>` per-frame records.
+perf-diag = ["dep:stats_alloc", "bevy/sysinfo_plugin"]
+# Per-system spans written as a Chrome trace (`trace-*.json` in the working
+# directory, or TRACE_CHROME=<file>); `tools/trace_summary.py` totals them.
+perf-trace = ["bevy/trace_chrome"]
+
+[lints]
+workspace = true

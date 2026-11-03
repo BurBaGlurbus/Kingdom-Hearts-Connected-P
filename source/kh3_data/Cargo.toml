@@ -1,0 +1,23 @@
+[package]
+name = "kh3_data"
+description = "Readers for the player's own KINGDOM HEARTS III install. Holds no KH3 files; see NOTICE for the numbers and names its recipes carry."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+# KH3's pak index (the key is in the player's own executable).
+aes = "=0.8.4"
+sha1 = "=0.10.6"
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+
+[[bin]]
+name = "kh3_probe"
+test = false
+bench = false
+
+[lints]
+workspace = true
